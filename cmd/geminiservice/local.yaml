@@ -1,0 +1,10 @@
+run_mode: "local"
+http_listen_addr: ":8095"
+project_id: "gemini-power-test"
+identity_service_url: "http://localhost:3000"
+cors:
+  allowed_origins:
+    - "http://localhost:3000"
+    - "http://localhost:4200" 
+    - "http://localhost:8080"
+  cors_role: "llm-client"
