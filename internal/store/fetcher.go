@@ -8,14 +8,8 @@ import (
 	"cloud.google.com/go/firestore"
 	"google.golang.org/api/iterator"
 
-	// Adjust this import path if you moved it to go-microservice-base
-	"github.com/tinywideclouds/go-llm-client/internal/filter"
-)
-
-const (
-	BundleCollection   = "CacheBundles"
-	FilesCollection    = "Files"
-	ProfilesCollection = "FilterProfiles"
+	"github.com/tinywideclouds/go-llm/pkg/cache/v1"
+	"github.com/tinywideclouds/go-llm/pkg/yaml/filter"
 )
 
 // Fetcher defines the contract for retrieving context from the database.
@@ -27,15 +21,17 @@ type Fetcher interface {
 }
 
 type FirestoreFetcher struct {
-	client *firestore.Client
-	logger *slog.Logger
+	client           *firestore.Client
+	storeCollections cache.StoreCollections
+	logger           *slog.Logger
 }
 
 // NewFirestoreFetcher initializes the database client for the LLM service.
-func NewFirestoreFetcher(client *firestore.Client, logger *slog.Logger) *FirestoreFetcher {
+func NewFirestoreFetcher(client *firestore.Client, storeCollections cache.StoreCollections, logger *slog.Logger) *FirestoreFetcher {
 	return &FirestoreFetcher{
-		client: client,
-		logger: logger,
+		client:           client,
+		storeCollections: storeCollections,
+		logger:           logger,
 	}
 }
 
@@ -51,7 +47,7 @@ func (f *FirestoreFetcher) FetchCacheFiles(ctx context.Context, cacheID, profile
 
 	// 1. If a ProfileID is provided, fetch and parse its rules first
 	if profileID != "" {
-		profileRef := f.client.Collection(BundleCollection).Doc(cacheID).Collection(ProfilesCollection).Doc(profileID)
+		profileRef := f.client.Collection(f.storeCollections.BundleCollection).Doc(cacheID).Collection(f.storeCollections.ProfilesCollection).Doc(profileID)
 		doc, err := profileRef.Get(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("failed to retrieve profile %s: %w", profileID, err)
@@ -74,7 +70,7 @@ func (f *FirestoreFetcher) FetchCacheFiles(ctx context.Context, cacheID, profile
 
 	// 2. Stream the files and apply the filter in-memory
 	filesMap := make(map[string]string)
-	filesRef := f.client.Collection(BundleCollection).Doc(cacheID).Collection(FilesCollection)
+	filesRef := f.client.Collection(f.storeCollections.BundleCollection).Doc(cacheID).Collection(f.storeCollections.FilesCollection)
 	iter := filesRef.Documents(ctx)
 
 	for {

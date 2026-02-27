@@ -13,11 +13,13 @@ import (
 	"syscall"
 	"time"
 
+	"cloud.google.com/go/firestore"
 	"google.golang.org/genai"
 	"gopkg.in/yaml.v3"
 
 	"github.com/tinywideclouds/go-llm-client/geminiservice"
 	"github.com/tinywideclouds/go-llm-client/geminiservice/config"
+	"github.com/tinywideclouds/go-llm-client/internal/store"
 	"github.com/tinywideclouds/go-microservice-base/pkg/middleware"
 )
 
@@ -69,12 +71,13 @@ func main() {
 
 	// --- 3. Dependency Injection ---
 
-	// 3a. LLM Client
-	genaiClient, err := newDependencies(ctx, cfg, logger)
+	// 3a. LLM Client & Datastores
+	genaiClient, firestoreFetcher, sessionStore, err := newDependencies(ctx, cfg, logger)
 	if err != nil {
 		logger.Error("Failed to initialize core dependencies", "err", err)
 		os.Exit(1)
 	}
+	defer firestoreFetcher.Close()
 
 	// 3b. Authentication Middleware
 	authMiddleware, err := newAuthMiddleware(cfg, logger)
@@ -84,7 +87,8 @@ func main() {
 	}
 
 	// --- 4. Create Service Instance ---
-	svc := geminiservice.NewGeminiService(cfg, genaiClient, authMiddleware, logger)
+	// Pass the new sessionStore into the wrapper constructor
+	svc := geminiservice.NewGeminiService(cfg, genaiClient, firestoreFetcher, sessionStore, authMiddleware, logger)
 
 	// --- 5. Start Service and Handle Shutdown ---
 	errChan := make(chan error, 1)
@@ -114,11 +118,11 @@ func main() {
 	}
 }
 
-// newDependencies builds the GenAI client.
-func newDependencies(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*genai.Client, error) {
+// newDependencies builds the GenAI and Firestore clients.
+func newDependencies(ctx context.Context, cfg *config.Config, logger *slog.Logger) (*genai.Client, store.Fetcher, store.SessionStore, error) {
 	if cfg.GeminiAPIKey == "" {
 		logger.Error("GEMINI_API_KEY config is missing")
-		return nil, fmt.Errorf("GEMINI_API_KEY is required")
+		return nil, nil, nil, fmt.Errorf("GEMINI_API_KEY is required")
 	}
 
 	clientConfig := &genai.ClientConfig{
@@ -127,11 +131,31 @@ func newDependencies(ctx context.Context, cfg *config.Config, logger *slog.Logge
 
 	client, err := genai.NewClient(ctx, clientConfig)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create Gemini client: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to create Gemini client: %w", err)
 	}
 
-	logger.Info("Gemini client initialized successfully")
-	return client, nil
+	fsClient, err := firestore.NewClient(ctx, cfg.GoogleProjectID)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to create Firestore client: %w", err)
+	}
+
+	// FIX: Use the shared cache.StoreCollections type correctly
+	fetcher := store.NewFirestoreFetcher(
+		fsClient,
+		cfg.Store,
+		logger.With("component", "FirestoreFetcher"),
+	)
+
+	// Initialize the new Session Store using the BundleCollection string
+	sessionStore := store.NewFirestoreSessionStore(
+		fsClient,
+		cfg.Store.BundleCollection,
+		logger.With("component", "FirestoreSession"),
+	)
+
+	logger.Info("Core dependencies initialized successfully")
+
+	return client, fetcher, sessionStore, nil
 }
 
 // newAuthMiddleware creates the JWT-validating middleware, or a bypass if in DEV mode.

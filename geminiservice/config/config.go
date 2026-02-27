@@ -5,25 +5,25 @@ import (
 	"os"
 	"strings"
 
+	"github.com/tinywideclouds/go-llm/pkg/cache/v1"
 	"github.com/tinywideclouds/go-microservice-base/pkg/middleware"
 )
 
 // Config defines the *single*, authoritative configuration for the LLM Service.
 type Config struct {
 	// Fields loaded from YAML
-	RunMode            string `yaml:"run_mode"`
-	HTTPListenAddr     string `yaml:"http_listen_addr"`
-	IdentityServiceURL string `yaml:"identity_service_url"`
+	RunMode            string
+	HTTPListenAddr     string
+	IdentityServiceURL string
 
-	Cors struct {
-		AllowedOrigins []string `yaml:"allowed_origins"`
-	} `yaml:"cors"`
+	GoogleProjectID string
+	Store           cache.StoreCollections
 
 	// CorsConfig is the processed, ready-to-use middleware config.
-	CorsConfig middleware.CorsConfig `yaml:"-"`
+	CorsConfig middleware.CorsConfig
 
 	// GeminiAPIKey is populated exclusively from the "GEMINI_API_KEY" env var.
-	GeminiAPIKey string `yaml:"-"`
+	GeminiAPIKey string
 }
 
 // UpdateConfigWithEnvOverrides takes the base configuration (created from YAML)
@@ -34,6 +34,11 @@ func UpdateConfigWithEnvOverrides(cfg *Config, logger *slog.Logger) (*Config, er
 	if idURL := os.Getenv("IDENTITY_SERVICE_URL"); idURL != "" {
 		logger.Debug("Overriding config value", "key", "IDENTITY_SERVICE_URL", "source", "env")
 		cfg.IdentityServiceURL = idURL
+	}
+
+	if projectID := os.Getenv("GOOGLE_PROJECT_ID"); projectID != "" {
+		logger.Debug("Loaded config value", "key", "GOOGLE_PROJECT_ID", "source", "env")
+		cfg.GoogleProjectID = projectID
 	}
 
 	if apiKey := os.Getenv("GEMINI_API_KEY"); apiKey != "" {

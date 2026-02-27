@@ -11,6 +11,7 @@ import (
 	"github.com/tinywideclouds/go-llm-client/internal/api"
 	llmservice "github.com/tinywideclouds/go-llm-client/internal/service"
 	"github.com/tinywideclouds/go-llm-client/internal/session"
+	"github.com/tinywideclouds/go-llm-client/internal/store"
 	"github.com/tinywideclouds/go-microservice-base/pkg/microservice"
 	"github.com/tinywideclouds/go-microservice-base/pkg/middleware"
 )
@@ -24,22 +25,25 @@ type Wrapper struct {
 func NewGeminiService(
 	cfg *config.Config,
 	client *genai.Client,
+	fetcher store.Fetcher,
+	sessionStore store.SessionStore, // <-- Injected Session Store
 	authMiddleware func(http.Handler) http.Handler,
 	logger *slog.Logger,
 ) *Wrapper {
 	// 1. Create the standard base server using the config port.
 	baseServer := microservice.NewBaseServer(logger, cfg.HTTPListenAddr)
 
-	// 2. Initialize Domain Managers.
-	sessionManager := session.NewManager()
+	// 2. Initialize Domain Services.
+	sessionService := session.NewService(sessionStore) // <-- Wire the store to the stateless service
 	managerLogger := logger.With("component", "LLMManager")
 	llmManager := llmservice.NewLLMManager(client, managerLogger)
 
 	// 3. Create the service-specific API handlers.
 	apiHandler := &api.API{
-		Sessions: sessionManager,
-		LLM:      llmManager,
-		Logger:   logger,
+		SessionService: sessionService, // <-- Inject domain service into the API
+		LLM:            llmManager,
+		Fetcher:        fetcher,
+		Logger:         logger,
 	}
 
 	// 4. Get the mux and create CORS middleware.
@@ -48,13 +52,18 @@ func NewGeminiService(
 	optionsHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})
 
 	// 5. Register OPTIONS for CORS pre-flight across the routes
+	mux.Handle("OPTIONS /v1/cache/build", corsMiddleware(optionsHandler))
 	mux.Handle("OPTIONS /v1/generate", corsMiddleware(optionsHandler))
+	mux.Handle("OPTIONS /v1/generate-stream", corsMiddleware(optionsHandler))
 	mux.Handle("OPTIONS /v1/session/{id}/proposals", corsMiddleware(optionsHandler))
 	mux.Handle("OPTIONS /v1/session/{id}/diffs", corsMiddleware(optionsHandler))
 	mux.Handle("OPTIONS /v1/session/{id}/proposals/{propId}/accept", corsMiddleware(optionsHandler))
 	mux.Handle("OPTIONS /v1/session/{id}/proposals/{propId}/reject", corsMiddleware(optionsHandler))
 
 	// 6. Register API Routes with CORS and Auth
+	buildCacheHandler := http.HandlerFunc(apiHandler.BuildCacheHandler)
+	mux.Handle("POST /v1/cache/build", corsMiddleware(authMiddleware(buildCacheHandler)))
+
 	generateHandler := http.HandlerFunc(apiHandler.GenerateHandler)
 	mux.Handle("POST /v1/generate", corsMiddleware(authMiddleware(generateHandler)))
 

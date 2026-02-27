@@ -3,6 +3,7 @@ package config
 import (
 	"log/slog"
 
+	"github.com/tinywideclouds/go-llm/pkg/cache/v1"
 	"github.com/tinywideclouds/go-microservice-base/pkg/middleware"
 )
 
@@ -11,7 +12,15 @@ type YamlConfig struct {
 	RunMode            string `yaml:"run_mode"`
 	HTTPListenAddr     string `yaml:"http_listen_addr"`
 	IdentityServiceURL string `yaml:"identity_service_url"`
-	Cors               struct {
+
+	GoogleProjectID string `yaml:"google_project_id"`
+	Firestore       struct {
+		BundleCollection   string `yaml:"bundle_collection"`
+		FilesCollection    string `yaml:"files_collection"`
+		ProfilesCollection string `yaml:"profiles_collection"`
+	} `yaml:"firestore"`
+
+	Cors struct {
 		AllowedOrigins []string `yaml:"allowed_origins"`
 		Role           string   `yaml:"cors_role"`
 	} `yaml:"cors"`
@@ -22,10 +31,31 @@ type YamlConfig struct {
 func NewConfigFromYaml(baseCfg *YamlConfig, logger *slog.Logger) (*Config, error) {
 	logger.Debug("Mapping YAML config to base config struct")
 
+	bc := baseCfg.Firestore.BundleCollection
+	if bc == "" {
+		bc = "CacheBundles"
+	}
+
+	fc := baseCfg.Firestore.FilesCollection
+	if fc == "" {
+		fc = "Files"
+	}
+
+	pc := baseCfg.Firestore.ProfilesCollection
+	if pc == "" {
+		pc = "FilterProfiles"
+	}
+
 	cfg := &Config{
 		RunMode:            baseCfg.RunMode,
 		HTTPListenAddr:     baseCfg.HTTPListenAddr,
 		IdentityServiceURL: baseCfg.IdentityServiceURL,
+		GoogleProjectID:    baseCfg.GoogleProjectID,
+		Store: cache.StoreCollections{
+			BundleCollection:   bc,
+			FilesCollection:    fc,
+			ProfilesCollection: pc,
+		},
 		CorsConfig: middleware.CorsConfig{
 			AllowedOrigins: baseCfg.Cors.AllowedOrigins,
 			Role:           middleware.CorsRole(baseCfg.Cors.Role),

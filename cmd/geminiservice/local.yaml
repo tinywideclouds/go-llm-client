@@ -1,7 +1,11 @@
 run_mode: "local"
 http_listen_addr: ":8095"
-project_id: "gemini-power-test"
+google_project_id: "gemini-power-test"
 identity_service_url: "http://localhost:3000"
+firestore:
+  bundle_collection: "CacheBundles"
+  files_collection: "Files"
+  profiles_collection: "FilterProfiles"
 cors:
   allowed_origins:
     - "http://localhost:3000"
