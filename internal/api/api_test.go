@@ -2,12 +2,12 @@ package api_test
 
 import (
 	"context"
-	"errors"
 	"io"
 	"iter"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,6 +22,7 @@ import (
 type mockSessionService struct {
 	acceptErr error
 	session   *builder.Session
+	proposals []builder.ChangeProposal
 }
 
 func (m *mockSessionService) GetSession(ctx context.Context, sessionID string) (*builder.Session, error) {
@@ -31,11 +32,15 @@ func (m *mockSessionService) GetSession(ctx context.Context, sessionID string) (
 	return &builder.Session{}, nil
 }
 
-func (m *mockSessionService) AcceptProposal(ctx context.Context, sessionID, proposalID string) error {
+func (m *mockSessionService) RemoveProposal(ctx context.Context, sessionID, proposalID string) error {
 	return m.acceptErr
 }
 
-func (m *mockSessionService) RejectProposal(ctx context.Context, sessionID, proposalID string) error {
+func (m *mockSessionService) ListProposalsBySession(ctx context.Context, sessionID string) ([]builder.ChangeProposal, error) {
+	return m.proposals, nil
+}
+
+func (m *mockSessionService) CreateProposal(ctx context.Context, proposal *builder.ChangeProposal) error {
 	return nil
 }
 
@@ -44,18 +49,23 @@ func (m *mockSessionService) SaveCompiledCache(ctx context.Context, firestoreCac
 }
 
 type mockLLMManager struct {
-	GenerateStreamResponseFunc func(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string) iter.Seq2[*genai.GenerateContentResponse, error]
 	CreateRepositoryCacheFunc  func(ctx context.Context, model string, files map[string]string, ttl time.Duration, explicitInstructions map[string]string) (string, error)
+	GenerateResponseFunc       func(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string) (*genai.GenerateContentResponse, error)
+	GenerateStreamResponseFunc func(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string) iter.Seq2[*genai.GenerateContentResponse, error]
+	InterceptToolCallFunc      func(ctx context.Context, chunk *genai.GenerateContentResponse, sessionID string) (*builder.ChangeProposal, bool, error)
 }
 
 func (m *mockLLMManager) CreateRepositoryCache(ctx context.Context, model string, files map[string]string, ttl time.Duration, explicitInstructions map[string]string) (string, error) {
 	if m.CreateRepositoryCacheFunc != nil {
 		return m.CreateRepositoryCacheFunc(ctx, model, files, ttl, explicitInstructions)
 	}
-	return "mock-cache-id", nil
+	return "cache-123", nil
 }
 
 func (m *mockLLMManager) GenerateResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string) (*genai.GenerateContentResponse, error) {
+	if m.GenerateResponseFunc != nil {
+		return m.GenerateResponseFunc(ctx, model, overlayPrompt, history, cacheID)
+	}
 	return &genai.GenerateContentResponse{}, nil
 }
 
@@ -66,25 +76,21 @@ func (m *mockLLMManager) GenerateStreamResponse(ctx context.Context, model strin
 	return func(yield func(*genai.GenerateContentResponse, error) bool) {}
 }
 
-type mockFetcher struct {
-	files map[string]string
+func (m *mockLLMManager) InterceptToolCall(ctx context.Context, chunk *genai.GenerateContentResponse, sessionID string) (*builder.ChangeProposal, bool, error) {
+	if m.InterceptToolCallFunc != nil {
+		return m.InterceptToolCallFunc(ctx, chunk, sessionID)
+	}
+	return nil, false, nil
 }
-
-func (m *mockFetcher) FetchCacheFiles(ctx context.Context, cacheID, profileID string) (map[string]string, error) {
-	return m.files, nil
-}
-func (m *mockFetcher) Close() error { return nil }
-
-// --- Setup ---
 
 func setupAPI() (*api.API, *mockSessionService, *mockFetcher, *mockLLMManager) {
 	sessionSvc := &mockSessionService{}
+	fetcher := &mockFetcher{}
 	llmMgr := &mockLLMManager{}
-	fetcher := &mockFetcher{files: make(map[string]string)}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	apiHandler := &api.API{
-		SessionService: sessionSvc, // Injected Domain Service
+		SessionService: sessionSvc,
 		LLM:            llmMgr,
 		Fetcher:        fetcher,
 		Logger:         logger,
@@ -95,40 +101,45 @@ func setupAPI() (*api.API, *mockSessionService, *mockFetcher, *mockLLMManager) {
 
 // --- Tests ---
 
-func TestAcceptProposalHandler(t *testing.T) {
-	apiHandler, sessionSvc, _, _ := setupAPI()
+func TestGenerateStreamHandler_ToolInterception(t *testing.T) {
+	apiHandler, _, _, llmMgr := setupAPI()
 
-	// Ensure the domain service simulates a successful accept
-	sessionSvc.acceptErr = nil
-
-	req := httptest.NewRequest(http.MethodPost, "/v1/session/sess-1/proposals/prop-1/accept", nil)
-	req.SetPathValue("id", "sess-1")
-	req.SetPathValue("propId", "prop-1")
-	w := httptest.NewRecorder()
-
-	apiHandler.AcceptProposalHandler(w, req)
-
-	res := w.Result()
-	if res.StatusCode != http.StatusOK {
-		t.Errorf("Expected status %d, got %d", http.StatusOK, res.StatusCode)
+	llmMgr.InterceptToolCallFunc = func(ctx context.Context, chunk *genai.GenerateContentResponse, sessionID string) (*builder.ChangeProposal, bool, error) {
+		prop := &builder.ChangeProposal{
+			ID:        "prop-123",
+			SessionID: sessionID,
+			FilePath:  "test.go",
+			Patch:     "@@ diff @@",
+		}
+		return prop, true, nil
 	}
-}
 
-func TestAcceptProposalHandler_Error(t *testing.T) {
-	apiHandler, sessionSvc, _, _ := setupAPI()
+	llmMgr.GenerateStreamResponseFunc = func(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string) iter.Seq2[*genai.GenerateContentResponse, error] {
+		return func(yield func(*genai.GenerateContentResponse, error) bool) {
+			dummyChunk := &genai.GenerateContentResponse{}
+			yield(dummyChunk, nil)
+		}
+	}
 
-	// Simulate business logic rejecting the request (e.g. proposal already accepted)
-	sessionSvc.acceptErr = errors.New("proposal is no longer pending")
+	reqBody := `{"sessionId": "sess-1", "history": [{"role": "user", "content": "Update the file"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/llm/generate-stream", strings.NewReader(reqBody))
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/session/sess-1/proposals/prop-1/accept", nil)
-	req.SetPathValue("id", "sess-1")
-	req.SetPathValue("propId", "prop-1")
 	w := httptest.NewRecorder()
-
-	apiHandler.AcceptProposalHandler(w, req)
+	apiHandler.GenerateStreamHandler(w, req)
 
 	res := w.Result()
-	if res.StatusCode != http.StatusBadRequest {
-		t.Errorf("Expected status %d, got %d", http.StatusBadRequest, res.StatusCode)
+	bodyBytes, _ := io.ReadAll(res.Body)
+	bodyStr := string(bodyBytes)
+
+	if res.Header.Get("Content-Type") != "text/event-stream" {
+		t.Errorf("Expected Content-Type text/event-stream, got %s", res.Header.Get("Content-Type"))
+	}
+
+	if !strings.Contains(bodyStr, "event: proposal_created") {
+		t.Error("Expected 'proposal_created' event in stream output")
+	}
+
+	if !strings.Contains(bodyStr, `"patch":"@@ diff @@"`) {
+		t.Error("Expected patch in SSE payload")
 	}
 }

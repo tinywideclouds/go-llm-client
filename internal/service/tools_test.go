@@ -7,7 +7,7 @@ import (
 )
 
 func TestGetTools(t *testing.T) {
-	tools := GetTools()
+	tools := GetWorkspaceTools()
 
 	if len(tools) == 0 {
 		t.Fatal("Expected at least one tool definition")
@@ -30,12 +30,15 @@ func TestGetTools(t *testing.T) {
 	}
 
 	required := proposalTool.Parameters.Required
-	if len(required) != 3 {
-		t.Errorf("Expected 3 required fields, got %d", len(required))
+	if len(required) != 2 {
+		t.Errorf("Expected 2 required fields (file_path, reasoning), got %d", len(required))
 	}
 
-	// Verify 'file_path' exists
-	if _, ok := proposalTool.Parameters.Properties["file_path"]; !ok {
-		t.Error("Missing 'file_path' parameter")
+	// Verify all properties exist
+	expectedProps := []string{"file_path", "patch", "new_content", "reasoning"}
+	for _, prop := range expectedProps {
+		if _, ok := proposalTool.Parameters.Properties[prop]; !ok {
+			t.Errorf("Missing expected parameter property: '%s'", prop)
+		}
 	}
 }

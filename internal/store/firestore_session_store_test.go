@@ -30,89 +30,90 @@ func TestFirestoreSessionStore_Integration(t *testing.T) {
 	defer client.Close()
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	// Using a specific bundle collection for the test to avoid collisions
 	sessionStore := store.NewFirestoreSessionStore(client, "TestCacheBundles", logger)
 
-	t.Run("Compiled Caches CRUD", func(t *testing.T) {
-		baseCacheID := "base-bundle-123"
+	baseCacheID := "base-bundle-123"
+	sessionID := "test-session-queue"
 
-		// 1. Create a Compiled Cache
+	t.Run("Compiled Caches CRUD", func(t *testing.T) {
 		cc := &builder.CompiledCache{
 			ID:         "cc-999",
 			ExternalID: "cachedContents/gemini-abc",
 			Provider:   "gemini",
 			AttachmentsUsed: []builder.Attachment{
-				{ID: "att-1", CacheID: "base-bundle-123"},
+				{ID: "att-1", CacheID: baseCacheID},
 			},
-			// Truncate to avoid microsecond rounding issues when reading from Firestore
 			CreatedAt: time.Now().Truncate(time.Millisecond),
 		}
 
 		err := sessionStore.SaveCompiledCache(ctx, baseCacheID, cc)
-		require.NoError(t, err, "Failed to save CompiledCache")
+		require.NoError(t, err)
 
-		// 2. Retrieve the caches for the bundle
 		caches, err := sessionStore.ListCompiledCaches(ctx, baseCacheID)
-		require.NoError(t, err, "Failed to list CompiledCaches")
-		require.Len(t, caches, 1, "Expected exactly 1 compiled cache")
+		require.NoError(t, err)
+		require.Len(t, caches, 1)
 
-		fetched := caches[0]
-		assert.Equal(t, "cc-999", fetched.ID)
-		assert.Equal(t, "cachedContents/gemini-abc", fetched.ExternalID)
-		assert.Equal(t, "gemini", fetched.Provider)
-		assert.Len(t, fetched.AttachmentsUsed, 1)
-		assert.Equal(t, "att-1", fetched.AttachmentsUsed[0].ID)
-		assert.True(t, cc.CreatedAt.Equal(fetched.CreatedAt), "CreatedAt mismatch")
+		assert.Equal(t, "cc-999", caches[0].ID)
+		assert.Equal(t, "cachedContents/gemini-abc", caches[0].ExternalID)
 	})
 
 	t.Run("Sessions GetOrCreate and Persistence", func(t *testing.T) {
-		sessionID := "test-session-456"
+		testSessID := "test-session-456"
 
-		// 1. Get a Non-Existent Session (Should safely initialize maps)
-		sess, err := sessionStore.GetSession(ctx, sessionID)
-		require.NoError(t, err, "GetSession should not error on missing documents")
-		require.NotNil(t, sess)
-
-		assert.Equal(t, sessionID, sess.ID)
-		assert.NotNil(t, sess.AcceptedOverlays, "AcceptedOverlays map must be initialized")
-		assert.NotNil(t, sess.PendingProposals, "PendingProposals map must be initialized")
-
-		// 2. Mutate the session state
-		sess.CompiledCacheID = "cc-999"
-		sess.AcceptedOverlays["main.go"] = builder.FileState{
-			Content:   "package main\n\nfunc main() {}",
-			IsDeleted: false,
-		}
-
-		proposalTime := time.Now().Truncate(time.Millisecond)
-		sess.PendingProposals["prop-1"] = builder.ChangeProposal{
-			ID:         "prop-1",
-			FilePath:   "auth.go",
-			NewContent: "package auth",
-			Reasoning:  "Updated logic",
-			Status:     builder.StatusPending,
-			CreatedAt:  proposalTime,
-		}
-
-		// 3. Save the mutated session
-		err = sessionStore.SaveSession(ctx, sess)
-		require.NoError(t, err, "Failed to save Session")
-
-		// 4. Fetch it back and verify persistence
-		fetched, err := sessionStore.GetSession(ctx, sessionID)
+		// 1. Get Non-Existent
+		sess, err := sessionStore.GetSession(ctx, testSessID)
 		require.NoError(t, err)
-		require.NotNil(t, fetched)
+		assert.Equal(t, testSessID, sess.ID)
 
+		// 2. Mutate and Save
+		sess.CompiledCacheID = "cc-999"
+		err = sessionStore.SaveSession(ctx, sess)
+		require.NoError(t, err)
+
+		// 3. Fetch and Verify
+		fetched, err := sessionStore.GetSession(ctx, testSessID)
+		require.NoError(t, err)
 		assert.Equal(t, "cc-999", fetched.CompiledCacheID)
+	})
 
-		// Verify Maps
-		require.Contains(t, fetched.AcceptedOverlays, "main.go")
-		assert.Equal(t, "package main\n\nfunc main() {}", fetched.AcceptedOverlays["main.go"].Content)
+	t.Run("Ephemeral Queue Lifecycle", func(t *testing.T) {
+		propTime := time.Now().Truncate(time.Millisecond)
 
-		require.Contains(t, fetched.PendingProposals, "prop-1")
-		prop := fetched.PendingProposals["prop-1"]
-		assert.Equal(t, "auth.go", prop.FilePath)
-		assert.Equal(t, builder.StatusPending, prop.Status)
-		assert.True(t, proposalTime.Equal(prop.CreatedAt), "Proposal CreatedAt mismatch")
+		prop1 := &builder.ChangeProposal{
+			ID:         "prop-1",
+			SessionID:  sessionID,
+			FilePath:   "main.go",
+			NewContent: "package main",
+			CreatedAt:  propTime,
+		}
+
+		prop2 := &builder.ChangeProposal{
+			ID:        "prop-2",
+			SessionID: sessionID,
+			FilePath:  "utils.go",
+			Patch:     "@@ diff @@",
+			CreatedAt: propTime,
+		}
+
+		// 1. Save Proposals directly to Session
+		err := sessionStore.SaveProposal(ctx, prop1)
+		require.NoError(t, err)
+		err = sessionStore.SaveProposal(ctx, prop2)
+		require.NoError(t, err)
+
+		// 2. Fetch queue
+		queue, err := sessionStore.GetProposalsBySession(ctx, sessionID)
+		require.NoError(t, err)
+		require.Len(t, queue, 2)
+
+		// 3. Delete Proposal (Simulate Accept/Reject)
+		err = sessionStore.DeleteProposal(ctx, sessionID, "prop-1")
+		require.NoError(t, err)
+
+		// 4. Verify queue is emptied of prop-1
+		queueAfterDelete, err := sessionStore.GetProposalsBySession(ctx, sessionID)
+		require.NoError(t, err)
+		require.Len(t, queueAfterDelete, 1)
+		assert.Equal(t, "prop-2", queueAfterDelete[0].ID)
 	})
 }

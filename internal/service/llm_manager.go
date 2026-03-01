@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/tinywideclouds/go-llm-client/internal/store"
 	"github.com/tinywideclouds/go-llm/pkg/builder/v1"
 
 	"google.golang.org/genai"
@@ -16,17 +17,22 @@ type LLMManager interface {
 	CreateRepositoryCache(ctx context.Context, model string, files map[string]string, ttl time.Duration, explicitInstructions map[string]string) (string, error)
 	GenerateResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string) (*genai.GenerateContentResponse, error)
 	GenerateStreamResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string) iter.Seq2[*genai.GenerateContentResponse, error]
+
+	// Tool Interception - Pure stateless parser
+	InterceptToolCall(ctx context.Context, chunk *genai.GenerateContentResponse, sessionID string) (*builder.ChangeProposal, bool, error)
 }
 
 type geminiManager struct {
-	client *genai.Client
-	Logger *slog.Logger
+	client  *genai.Client
+	fetcher store.Fetcher
+	Logger  *slog.Logger
 }
 
-func NewLLMManager(client *genai.Client, logger *slog.Logger) LLMManager {
+func NewLLMManager(client *genai.Client, fetcher store.Fetcher, logger *slog.Logger) LLMManager {
 	return &geminiManager{
-		client: client,
-		Logger: logger,
+		client:  client,
+		fetcher: fetcher,
+		Logger:  logger,
 	}
 }
 
@@ -81,7 +87,7 @@ func (m *geminiManager) GenerateResponse(ctx context.Context, model string, over
 	contents := BuildHistoryContents(history, overlayPrompt)
 
 	config := &genai.GenerateContentConfig{
-		Tools: GetTools(),
+		Tools: GetWorkspaceTools(),
 	}
 
 	// Inject the Cache ID if we have one!
@@ -98,7 +104,7 @@ func (m *geminiManager) GenerateStreamResponse(ctx context.Context, model string
 	contents := BuildHistoryContents(history, overlayPrompt)
 
 	config := &genai.GenerateContentConfig{
-		Tools: GetTools(),
+		Tools: GetWorkspaceTools(),
 	}
 
 	// Inject the Cache ID if we have one!
@@ -108,6 +114,42 @@ func (m *geminiManager) GenerateStreamResponse(ctx context.Context, model string
 	}
 
 	return m.client.Models.GenerateContentStream(ctx, model, contents, config)
+}
+
+func (m *geminiManager) InterceptToolCall(ctx context.Context, chunk *genai.GenerateContentResponse, sessionID string) (*builder.ChangeProposal, bool, error) {
+	if len(chunk.Candidates) == 0 || chunk.Candidates[0].Content == nil {
+		return nil, false, nil
+	}
+
+	for _, part := range chunk.Candidates[0].Content.Parts {
+		// Access the struct pointer instead of type assertion
+		if part.FunctionCall == nil || part.FunctionCall.Name != "propose_change" {
+			continue
+		}
+
+		args := part.FunctionCall.Args
+		filePath, _ := args["file_path"].(string)
+		patch, _ := args["patch"].(string)
+		newContent, _ := args["new_content"].(string)
+		reasoning, _ := args["reasoning"].(string)
+
+		// 1. Build the stateless proposal (Status is gone!)
+		prop := &builder.ChangeProposal{
+			ID:         fmt.Sprintf("prop-%d", time.Now().UnixNano()),
+			SessionID:  sessionID,
+			FilePath:   filePath,
+			Patch:      patch,
+			NewContent: newContent,
+			Reasoning:  reasoning,
+			CreatedAt:  time.Now(),
+		}
+
+		// 2. Return the stateless proposal.
+		// The LLM Manager is no longer responsible for fetching the original base file content.
+		return prop, true, nil
+	}
+
+	return nil, false, nil
 }
 
 // BuildHistoryContents maps our generic Messages to the genai SDK types and injects the overlay

@@ -6,17 +6,19 @@ import (
 	"github.com/tinywideclouds/go-llm/pkg/builder/v1"
 )
 
-// SessionStore defines the contract for persisting LLM chat sessions
-// and external compiled cache metadata.
+// SessionStore defines the contract for persisting LLM chat sessions,
+// external compiled cache metadata, and the ephemeral proposal queue.
 type SessionStore interface {
-	// Compiled Caches (Stored under /CacheBundles/{CacheID}/CompiledCaches/)
+	// Compiled Caches (Metadata pointers)
 	SaveCompiledCache(ctx context.Context, firestoreCacheID string, cache *builder.CompiledCache) error
 	ListCompiledCaches(ctx context.Context, firestoreCacheID string) ([]builder.CompiledCache, error)
 
-	// Sessions (Stored under /LlmSessions/)
-
-	// GetSession retrieves a session by ID. If the session does not exist,
-	// it should return a cleanly initialized empty Session (acting as GetOrCreate).
+	// Sessions
 	GetSession(ctx context.Context, sessionID string) (*builder.Session, error)
 	SaveSession(ctx context.Context, session *builder.Session) error
+
+	// Ephemeral Proposal Queue
+	SaveProposal(ctx context.Context, proposal *builder.ChangeProposal) error
+	GetProposalsBySession(ctx context.Context, sessionID string) ([]builder.ChangeProposal, error)
+	DeleteProposal(ctx context.Context, sessionID, proposalID string) error
 }

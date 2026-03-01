@@ -17,15 +17,15 @@ import (
 const (
 	LlmSessionsCollection = "LlmSessions"
 	CompiledCachesSubCol  = "CompiledCaches"
+	ProposalsSubCol       = "Proposals" // Now an ephemeral queue under LlmSessions
 )
 
 type FirestoreSessionStore struct {
 	client    *firestore.Client
-	bundleCol string // Allows pointing to "CacheBundles" or "CacheBundles_Dev"
+	bundleCol string
 	logger    *slog.Logger
 }
 
-// NewFirestoreSessionStore initializes the persistent session store.
 func NewFirestoreSessionStore(client *firestore.Client, bundleCol string, logger *slog.Logger) *FirestoreSessionStore {
 	return &FirestoreSessionStore{
 		client:    client,
@@ -47,7 +47,6 @@ func (s *FirestoreSessionStore) SaveCompiledCache(ctx context.Context, firestore
 
 func (s *FirestoreSessionStore) ListCompiledCaches(ctx context.Context, firestoreCacheID string) ([]builder.CompiledCache, error) {
 	var caches []builder.CompiledCache
-
 	iter := s.client.Collection(s.bundleCol).Doc(firestoreCacheID).Collection(CompiledCachesSubCol).Documents(ctx)
 	for {
 		doc, err := iter.Next()
@@ -63,10 +62,9 @@ func (s *FirestoreSessionStore) ListCompiledCaches(ctx context.Context, firestor
 			s.logger.Warn("Failed to unmarshal compiled cache", "docID", doc.Ref.ID, "error", err)
 			continue
 		}
-		c.ID = doc.Ref.ID // Inject the Firestore document ID back into the struct
+		c.ID = doc.Ref.ID
 		caches = append(caches, c)
 	}
-
 	return caches, nil
 }
 
@@ -75,14 +73,11 @@ func (s *FirestoreSessionStore) ListCompiledCaches(ctx context.Context, firestor
 func (s *FirestoreSessionStore) GetSession(ctx context.Context, sessionID string) (*builder.Session, error) {
 	doc, err := s.client.Collection(LlmSessionsCollection).Doc(sessionID).Get(ctx)
 
-	// If it doesn't exist, replicate GetOrCreate behavior by returning an empty, safely initialized session
 	if status.Code(err) == codes.NotFound {
 		s.logger.Debug("Session not found, creating new instance", "session_id", sessionID)
 		return &builder.Session{
-			ID:               sessionID,
-			AcceptedOverlays: make(map[string]builder.FileState),
-			PendingProposals: make(map[string]builder.ChangeProposal),
-			UpdatedAt:        time.Now(),
+			ID:        sessionID,
+			UpdatedAt: time.Now(),
 		}, nil
 	}
 	if err != nil {
@@ -95,14 +90,6 @@ func (s *FirestoreSessionStore) GetSession(ctx context.Context, sessionID string
 	}
 	sess.ID = doc.Ref.ID
 
-	// Ensure maps are never nil to prevent panics during assignment
-	if sess.AcceptedOverlays == nil {
-		sess.AcceptedOverlays = make(map[string]builder.FileState)
-	}
-	if sess.PendingProposals == nil {
-		sess.PendingProposals = make(map[string]builder.ChangeProposal)
-	}
-
 	return &sess, nil
 }
 
@@ -113,6 +100,51 @@ func (s *FirestoreSessionStore) SaveSession(ctx context.Context, session *builde
 	_, err := ref.Set(ctx, session)
 	if err != nil {
 		return fmt.Errorf("failed to save session: %w", err)
+	}
+	return nil
+}
+
+// --- Ephemeral Proposal Queue ---
+
+func (s *FirestoreSessionStore) SaveProposal(ctx context.Context, proposal *builder.ChangeProposal) error {
+	// Saved directly under the specific session
+	ref := s.client.Collection(LlmSessionsCollection).Doc(proposal.SessionID).Collection(ProposalsSubCol).Doc(proposal.ID)
+	_, err := ref.Set(ctx, proposal)
+	if err != nil {
+		return fmt.Errorf("failed to save proposal: %w", err)
+	}
+	return nil
+}
+
+func (s *FirestoreSessionStore) GetProposalsBySession(ctx context.Context, sessionID string) ([]builder.ChangeProposal, error) {
+	var proposals []builder.ChangeProposal
+	// Simple subcollection read
+	iter := s.client.Collection(LlmSessionsCollection).Doc(sessionID).Collection(ProposalsSubCol).Documents(ctx)
+
+	for {
+		doc, err := iter.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to list proposals by session: %w", err)
+		}
+
+		var p builder.ChangeProposal
+		if err := doc.DataTo(&p); err != nil {
+			continue
+		}
+		p.ID = doc.Ref.ID
+		proposals = append(proposals, p)
+	}
+	return proposals, nil
+}
+
+func (s *FirestoreSessionStore) DeleteProposal(ctx context.Context, sessionID, proposalID string) error {
+	ref := s.client.Collection(LlmSessionsCollection).Doc(sessionID).Collection(ProposalsSubCol).Doc(proposalID)
+	_, err := ref.Delete(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to delete proposal: %w", err)
 	}
 	return nil
 }

@@ -23,8 +23,8 @@ type API struct {
 	Logger         *slog.Logger
 }
 
-// BuildCacheHandler handles POST /v1/cache/build
-func (a *API) BuildCacheHandler(w http.ResponseWriter, r *http.Request) {
+// BuildCompiledCacheHandler handles POST /v1/llm/compiled_cache/build
+func (a *API) BuildCompiledCacheHandler(w http.ResponseWriter, r *http.Request) {
 	var req builder.BuildCacheRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		response.WriteJSONError(w, http.StatusBadRequest, "Invalid JSON body")
@@ -36,7 +36,7 @@ func (a *API) BuildCacheHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. Fetch all requested files from Firestore
+	// 1. Fetch all requested files from Firestore (Original correct implementation)
 	allFiles := make(map[string]string)
 	for _, att := range req.Attachments {
 		if att.CacheID == "" {
@@ -58,7 +58,7 @@ func (a *API) BuildCacheHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 2. Upload to Google Gemini to build the cached context
-	cacheName, err := a.LLM.CreateRepositoryCache(r.Context(), req.Model, allFiles, 1*time.Hour, nil)
+	compiledCacheName, err := a.LLM.CreateRepositoryCache(r.Context(), req.Model, allFiles, 1*time.Hour, nil)
 	if err != nil {
 		a.Logger.Error("Failed to build Gemini cache", "error", err)
 		response.WriteJSONError(w, http.StatusInternalServerError, "Failed to build context cache on Google servers")
@@ -69,62 +69,24 @@ func (a *API) BuildCacheHandler(w http.ResponseWriter, r *http.Request) {
 	baseCacheID := req.Attachments[0].CacheID
 	compiledCache := &builder.CompiledCache{
 		ID:              fmt.Sprintf("cc-%d", time.Now().UnixNano()),
-		ExternalID:      cacheName,
+		ExternalID:      compiledCacheName,
 		Provider:        "gemini",
 		AttachmentsUsed: req.Attachments,
 		CreatedAt:       time.Now(),
 	}
 
-	// Delegated to domain service
 	if err := a.SessionService.SaveCompiledCache(r.Context(), baseCacheID, compiledCache); err != nil {
 		a.Logger.Error("Failed to save compiled cache metadata", "error", err)
 	}
 
 	cacheResponse := &builder.BuildCacheResponse{
-		GeminiCacheId: cacheName,
+		GeminiCacheId: compiledCacheName,
 	}
 
 	response.WriteJSON(w, http.StatusCreated, cacheResponse)
 }
 
-// GenerateHandler handles the POST /v1/generate request.
-func (a *API) GenerateHandler(w http.ResponseWriter, r *http.Request) {
-	var req builder.GenerateStreamRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		response.WriteJSONError(w, http.StatusBadRequest, "Invalid JSON body")
-		return
-	}
-
-	if len(req.History) == 0 {
-		response.WriteJSONError(w, http.StatusBadRequest, "History cannot be empty")
-		return
-	}
-
-	model := req.Model
-	if model == "" {
-		model = "gemini-3-flash-preview"
-	}
-
-	session, err := a.SessionService.GetSession(r.Context(), req.SessionID)
-	if err != nil {
-		a.Logger.Error("Failed to retrieve session", "error", err)
-		response.WriteJSONError(w, http.StatusInternalServerError, "Failed to retrieve session state")
-		return
-	}
-
-	overlayPrompt := BuildOverlayPrompt(session.AcceptedOverlays)
-
-	resp, err := a.LLM.GenerateResponse(r.Context(), model, overlayPrompt, req.History, req.GeminiCacheID)
-	if err != nil {
-		a.Logger.Error("Gemini request failed", "error", err)
-		response.WriteJSONError(w, http.StatusInternalServerError, "AI Provider Error")
-		return
-	}
-
-	response.WriteJSON(w, http.StatusOK, resp)
-}
-
-// GenerateStreamHandler handles POST /v1/generate-stream
+// GenerateStreamHandler handles POST /v1/llm/generate-stream
 func (a *API) GenerateStreamHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -154,20 +116,18 @@ func (a *API) GenerateStreamHandler(w http.ResponseWriter, r *http.Request) {
 		model = "gemini-3-flash-preview"
 	}
 
+	// 1. Build Inline Context (Read-Only Fetcher usage)
 	inlineContext := BuildInlineContext(r.Context(), a.Fetcher, req.InlineAttachments, a.Logger)
 	req.History = InjectInlineContext(req.History, inlineContext)
 
-	sess, err := a.SessionService.GetSession(r.Context(), req.SessionID)
+	// 2. Fetch the Pending Ephemeral Queue to remind the LLM what it already proposed
+	pendingProposals, err := a.SessionService.ListProposalsBySession(r.Context(), req.SessionID)
 	if err != nil {
-		a.Logger.Error("Failed to retrieve session", "error", err)
-		fmt.Fprintf(w, "event: error\ndata: %s\n\n", "Failed to retrieve session state")
-		flusher.Flush()
-		return
+		a.Logger.Warn("Failed to retrieve pending proposals for context", "error", err)
 	}
 
-	overlayPrompt := BuildOverlayPrompt(sess.AcceptedOverlays)
-
-	stream := a.LLM.GenerateStreamResponse(r.Context(), model, overlayPrompt, req.History, req.GeminiCacheID)
+	// 3. Stream Response
+	stream := a.LLM.GenerateStreamResponse(r.Context(), model, BuildOverlayPrompt(pendingProposals), req.History, req.GeminiCacheID)
 
 	for chunk, err := range stream {
 		if err != nil {
@@ -177,6 +137,29 @@ func (a *API) GenerateStreamHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// 4. Pure Stateless Tool Interception
+		prop, isTool, toolErr := a.LLM.InterceptToolCall(r.Context(), chunk, req.SessionID)
+		if toolErr != nil {
+			a.Logger.Error("Tool processing failed", "error", toolErr)
+		}
+
+		if isTool {
+			// 5. Add to the ephemeral queue
+			if err := a.SessionService.CreateProposal(r.Context(), prop); err != nil {
+				a.Logger.Error("Failed to save pending proposal", "error", err)
+			}
+
+			// 6. Emit the lightweight SSE
+			eventData := map[string]interface{}{
+				"proposal": prop,
+			}
+			eventBytes, _ := json.Marshal(eventData)
+			fmt.Fprintf(w, "event: proposal_created\ndata: %s\n\n", string(eventBytes))
+			flusher.Flush()
+			continue
+		}
+
+		// 7. Standard Text Streaming
 		chunkBytes, err := json.Marshal(chunk)
 		if err != nil {
 			a.Logger.Error("Failed to marshal chunk", "error", err)
@@ -191,44 +174,26 @@ func (a *API) GenerateStreamHandler(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 }
 
-// ListProposalsHandler handles GET /v1/session/{id}/proposals
+// ListProposalsHandler handles GET /v1/llm/session/{id}/proposals
 func (a *API) ListProposalsHandler(w http.ResponseWriter, r *http.Request) {
-	sess, err := a.SessionService.GetSession(r.Context(), r.PathValue("id"))
+	sessionID := r.PathValue("id")
+
+	proposals, err := a.SessionService.ListProposalsBySession(r.Context(), sessionID)
 	if err != nil {
-		response.WriteJSONError(w, http.StatusInternalServerError, "Failed to retrieve session state")
+		response.WriteJSONError(w, http.StatusInternalServerError, "Failed to retrieve proposals")
 		return
 	}
-	response.WriteJSON(w, http.StatusOK, sess.PendingProposals)
+
+	response.WriteJSON(w, http.StatusOK, proposals)
 }
 
-// GetDiffsHandler handles GET /v1/session/{id}/diffs
-func (a *API) GetDiffsHandler(w http.ResponseWriter, r *http.Request) {
-	sess, err := a.SessionService.GetSession(r.Context(), r.PathValue("id"))
-	if err != nil {
-		response.WriteJSONError(w, http.StatusInternalServerError, "Failed to retrieve session state")
-		return
-	}
-	response.WriteJSON(w, http.StatusOK, sess.AcceptedOverlays)
-}
-
-// AcceptProposalHandler handles POST /v1/session/{id}/proposals/{propId}/accept
-func (a *API) AcceptProposalHandler(w http.ResponseWriter, r *http.Request) {
-	err := a.SessionService.AcceptProposal(r.Context(), r.PathValue("id"), r.PathValue("propId"))
+// RemoveProposalHandler handles DELETE /v1/llm/session/{id}/proposals/{propId}
+func (a *API) RemoveProposalHandler(w http.ResponseWriter, r *http.Request) {
+	err := a.SessionService.RemoveProposal(r.Context(), r.PathValue("id"), r.PathValue("propId"))
 	if err != nil {
 		response.WriteJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	response.WriteJSON(w, http.StatusOK, map[string]string{"status": "merged"})
-}
-
-// RejectProposalHandler handles POST /v1/session/{id}/proposals/{propId}/reject
-func (a *API) RejectProposalHandler(w http.ResponseWriter, r *http.Request) {
-	err := a.SessionService.RejectProposal(r.Context(), r.PathValue("id"), r.PathValue("propId"))
-	if err != nil {
-		response.WriteJSONError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	response.WriteJSON(w, http.StatusOK, map[string]string{"status": "rejected"})
+	response.WriteJSON(w, http.StatusOK, map[string]string{"status": "removed"})
 }

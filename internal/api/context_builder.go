@@ -40,20 +40,21 @@ func InjectInlineContext(history []builder.Message, inlineContext string) []buil
 	return history
 }
 
-// BuildOverlayPrompt generates the <system_note> XML block for modified files currently in the session.
-// FIX: Updated to use the new builder.FileState facade type
-func BuildOverlayPrompt(overlays map[string]builder.FileState) string {
-	if len(overlays) == 0 {
+// BuildOverlayPrompt generates the <system_note> XML block for PENDING proposals in the queue.
+func BuildOverlayPrompt(pending []builder.ChangeProposal) string {
+	if len(pending) == 0 {
 		return ""
 	}
 
-	prompt := "<system_note>\nThe following files have unsaved changes in the current session. Use these versions instead of the ones in the base repository cache:\n"
-	for path, state := range overlays {
-		if state.IsDeleted {
-			prompt += fmt.Sprintf("<file path=%q status=\"deleted\" />\n", path)
-		} else {
-			prompt += fmt.Sprintf("<file path=%q>\n%s\n</file>\n", path, state.Content)
+	prompt := "<system_note>\nThe following files have PENDING changes awaiting user approval. Take these proposed changes into account to avoid contradicting them:\n"
+	for _, p := range pending {
+		prompt += fmt.Sprintf("<pending_proposal file=%q>\n", p.FilePath)
+		if p.Patch != "" {
+			prompt += fmt.Sprintf("Patch:\n%s\n", p.Patch)
+		} else if p.NewContent != "" {
+			prompt += fmt.Sprintf("New Content:\n%s\n", p.NewContent)
 		}
+		prompt += "</pending_proposal>\n"
 	}
 	prompt += "</system_note>\n"
 	return prompt

@@ -12,6 +12,15 @@ import (
 	"github.com/tinywideclouds/go-llm/pkg/builder/v1"
 )
 
+type mockFetcher struct {
+	files map[string]string
+}
+
+func (m *mockFetcher) FetchCacheFiles(ctx context.Context, cacheID, profileID string) (map[string]string, error) {
+	return m.files, nil
+}
+func (m *mockFetcher) Close() error { return nil }
+
 func TestBuildInlineContext(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	fetcher := &mockFetcher{
@@ -49,26 +58,23 @@ func TestInjectInlineContext(t *testing.T) {
 }
 
 func TestBuildOverlayPrompt(t *testing.T) {
-	t.Run("Empty Overlays", func(t *testing.T) {
-		// FIX: Updated to builder.FileState
-		overlays := make(map[string]builder.FileState)
-		assert.Equal(t, "", api.BuildOverlayPrompt(overlays))
+	t.Run("Empty Pending Queue", func(t *testing.T) {
+		pending := []builder.ChangeProposal{}
+		assert.Equal(t, "", api.BuildOverlayPrompt(pending))
 	})
 
-	t.Run("Modified and Deleted Files", func(t *testing.T) {
-		// FIX: Updated to builder.FileState
-		overlays := map[string]builder.FileState{
-			"modified.go": {Content: "func new() {}", IsDeleted: false},
-			"removed.go":  {Content: "", IsDeleted: true},
+	t.Run("Populated Pending Queue", func(t *testing.T) {
+		pending := []builder.ChangeProposal{
+			{FilePath: "main.go", Patch: "@@ diff @@"},
+			{FilePath: "utils.go", NewContent: "package utils"},
 		}
 
-		result := api.BuildOverlayPrompt(overlays)
-
+		result := api.BuildOverlayPrompt(pending)
 		assert.Contains(t, result, "<system_note>")
-		assert.Contains(t, result, "unsaved changes")
-		assert.Contains(t, result, `<file path="modified.go">`)
-		assert.Contains(t, result, `func new() {}`)
-		assert.Contains(t, result, `<file path="removed.go" status="deleted" />`)
-		assert.Contains(t, result, "</system_note>")
+		assert.Contains(t, result, "PENDING changes awaiting user approval")
+		assert.Contains(t, result, `<pending_proposal file="main.go">`)
+		assert.Contains(t, result, "@@ diff @@")
+		assert.Contains(t, result, `<pending_proposal file="utils.go">`)
+		assert.Contains(t, result, "package utils")
 	})
 }

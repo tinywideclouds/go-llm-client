@@ -2,7 +2,6 @@ package session
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/tinywideclouds/go-llm-client/internal/store"
 	"github.com/tinywideclouds/go-llm/pkg/builder/v1"
@@ -11,8 +10,11 @@ import (
 // Service defines the business logic operations for workspace sessions.
 type Service interface {
 	GetSession(ctx context.Context, sessionID string) (*builder.Session, error)
-	AcceptProposal(ctx context.Context, sessionID, proposalID string) error
-	RejectProposal(ctx context.Context, sessionID, proposalID string) error
+
+	// Ephemeral Queue Operations
+	CreateProposal(ctx context.Context, proposal *builder.ChangeProposal) error
+	ListProposalsBySession(ctx context.Context, sessionID string) ([]builder.ChangeProposal, error)
+	RemoveProposal(ctx context.Context, sessionID, proposalID string) error
 
 	// Passed through for convenience so the API only needs one dependency
 	SaveCompiledCache(ctx context.Context, firestoreCacheID string, cache *builder.CompiledCache) error
@@ -37,56 +39,14 @@ func (s *statelessService) GetSession(ctx context.Context, sessionID string) (*b
 	return s.store.GetSession(ctx, sessionID)
 }
 
-func (s *statelessService) AcceptProposal(ctx context.Context, sessionID, proposalID string) error {
-	sess, err := s.store.GetSession(ctx, sessionID)
-	if err != nil {
-		return fmt.Errorf("failed to retrieve session: %w", err)
-	}
-
-	prop, exists := sess.PendingProposals[proposalID]
-	if !exists {
-		return fmt.Errorf("proposal not found")
-	}
-	if prop.Status != builder.StatusPending {
-		return fmt.Errorf("proposal is no longer pending")
-	}
-
-	// Apply the business logic
-	prop.Status = builder.StatusAccepted
-	sess.PendingProposals[proposalID] = prop
-	sess.AcceptedOverlays[prop.FilePath] = builder.FileState{
-		Content:   prop.NewContent,
-		IsDeleted: false,
-	}
-
-	if err := s.store.SaveSession(ctx, sess); err != nil {
-		return fmt.Errorf("failed to save session state: %w", err)
-	}
-
-	return nil
+func (s *statelessService) CreateProposal(ctx context.Context, proposal *builder.ChangeProposal) error {
+	return s.store.SaveProposal(ctx, proposal)
 }
 
-func (s *statelessService) RejectProposal(ctx context.Context, sessionID, proposalID string) error {
-	sess, err := s.store.GetSession(ctx, sessionID)
-	if err != nil {
-		return fmt.Errorf("failed to retrieve session: %w", err)
-	}
+func (s *statelessService) ListProposalsBySession(ctx context.Context, sessionID string) ([]builder.ChangeProposal, error) {
+	return s.store.GetProposalsBySession(ctx, sessionID)
+}
 
-	prop, exists := sess.PendingProposals[proposalID]
-	if !exists {
-		return fmt.Errorf("proposal not found")
-	}
-	if prop.Status != builder.StatusPending {
-		return fmt.Errorf("proposal is no longer pending")
-	}
-
-	// Apply the business logic
-	prop.Status = builder.StatusRejected
-	sess.PendingProposals[proposalID] = prop
-
-	if err := s.store.SaveSession(ctx, sess); err != nil {
-		return fmt.Errorf("failed to save session state: %w", err)
-	}
-
-	return nil
+func (s *statelessService) RemoveProposal(ctx context.Context, sessionID, proposalID string) error {
+	return s.store.DeleteProposal(ctx, sessionID, proposalID)
 }
