@@ -15,11 +15,11 @@ import (
 
 type LLMManager interface {
 	CreateRepositoryCache(ctx context.Context, model string, files map[string]string, ttl time.Duration, explicitInstructions map[string]string) (string, error)
-	GenerateResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string) (*genai.GenerateContentResponse, error)
-	GenerateStreamResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string) iter.Seq2[*genai.GenerateContentResponse, error]
+	GenerateResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string, extraHistory []*genai.Content) (*genai.GenerateContentResponse, error)
+	GenerateStreamResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string, extraHistory []*genai.Content) iter.Seq2[*genai.GenerateContentResponse, error]
 
 	// Tool Interception - Pure stateless parser
-	InterceptToolCall(ctx context.Context, chunk *genai.GenerateContentResponse, sessionID string) (*builder.ChangeProposal, bool, error)
+	InterceptToolCalls(ctx context.Context, chunk *genai.GenerateContentResponse, sessionID string) ([]*builder.ChangeProposal, error)
 }
 
 type geminiManager struct {
@@ -64,7 +64,6 @@ func (m *geminiManager) CreateRepositoryCache(ctx context.Context, model string,
 		sysInst = &genai.Content{Parts: instructionParts}
 	}
 
-	// Use the NEW SDK configuration struct
 	config := &genai.CreateCachedContentConfig{
 		Contents:          contents,
 		SystemInstruction: sysInst,
@@ -72,7 +71,6 @@ func (m *geminiManager) CreateRepositoryCache(ctx context.Context, model string,
 		DisplayName:       "repo-cache-" + time.Now().Format("20060102150405"),
 	}
 
-	// The new SDK requires (ctx, model, config)
 	createdCache, err := m.client.Caches.Create(ctx, model, config)
 	if err != nil {
 		return "", fmt.Errorf("failed to create context cache on Google servers: %w", err)
@@ -83,14 +81,16 @@ func (m *geminiManager) CreateRepositoryCache(ctx context.Context, model string,
 }
 
 // GenerateResponse generates a single blocking response utilizing the cache if provided.
-func (m *geminiManager) GenerateResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string) (*genai.GenerateContentResponse, error) {
+func (m *geminiManager) GenerateResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string, extraHistory []*genai.Content) (*genai.GenerateContentResponse, error) {
 	contents := BuildHistoryContents(history, overlayPrompt)
+	if len(extraHistory) > 0 {
+		contents = append(contents, extraHistory...)
+	}
 
 	config := &genai.GenerateContentConfig{
 		Tools: GetWorkspaceTools(),
 	}
 
-	// Inject the Cache ID if we have one!
 	if cacheID != "" {
 		config.CachedContent = cacheID
 		m.Logger.Debug("Using Gemini Context Cache for generation", "cache_name", cacheID)
@@ -100,14 +100,16 @@ func (m *geminiManager) GenerateResponse(ctx context.Context, model string, over
 }
 
 // GenerateStreamResponse streams the generation back utilizing the cache if provided.
-func (m *geminiManager) GenerateStreamResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string) iter.Seq2[*genai.GenerateContentResponse, error] {
+func (m *geminiManager) GenerateStreamResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string, extraHistory []*genai.Content) iter.Seq2[*genai.GenerateContentResponse, error] {
 	contents := BuildHistoryContents(history, overlayPrompt)
+	if len(extraHistory) > 0 {
+		contents = append(contents, extraHistory...)
+	}
 
 	config := &genai.GenerateContentConfig{
 		Tools: GetWorkspaceTools(),
 	}
 
-	// Inject the Cache ID if we have one!
 	if cacheID != "" {
 		config.CachedContent = cacheID
 		m.Logger.Debug("Using Gemini Context Cache for stream generation", "cache_name", cacheID)
@@ -116,16 +118,22 @@ func (m *geminiManager) GenerateStreamResponse(ctx context.Context, model string
 	return m.client.Models.GenerateContentStream(ctx, model, contents, config)
 }
 
-func (m *geminiManager) InterceptToolCall(ctx context.Context, chunk *genai.GenerateContentResponse, sessionID string) (*builder.ChangeProposal, bool, error) {
+func (m *geminiManager) InterceptToolCalls(ctx context.Context, chunk *genai.GenerateContentResponse, sessionID string) ([]*builder.ChangeProposal, error) {
+	var proposals []*builder.ChangeProposal
+
 	if len(chunk.Candidates) == 0 || chunk.Candidates[0].Content == nil {
-		return nil, false, nil
+		return proposals, nil
 	}
 
-	for _, part := range chunk.Candidates[0].Content.Parts {
-		// Access the struct pointer instead of type assertion
+	parts := chunk.Candidates[0].Content.Parts
+	m.Logger.Debug("InterceptToolCalls inspecting candidate parts", "parts_count", len(parts))
+
+	for i, part := range parts {
 		if part.FunctionCall == nil || part.FunctionCall.Name != "propose_change" {
 			continue
 		}
+
+		m.Logger.Info("Found propose_change tool call in chunk part", "part_index", i)
 
 		args := part.FunctionCall.Args
 		filePath, _ := args["file_path"].(string)
@@ -133,7 +141,6 @@ func (m *geminiManager) InterceptToolCall(ctx context.Context, chunk *genai.Gene
 		newContent, _ := args["new_content"].(string)
 		reasoning, _ := args["reasoning"].(string)
 
-		// 1. Build the stateless proposal (Status is gone!)
 		prop := &builder.ChangeProposal{
 			ID:         fmt.Sprintf("prop-%d", time.Now().UnixNano()),
 			SessionID:  sessionID,
@@ -144,12 +151,14 @@ func (m *geminiManager) InterceptToolCall(ctx context.Context, chunk *genai.Gene
 			CreatedAt:  time.Now(),
 		}
 
-		// 2. Return the stateless proposal.
-		// The LLM Manager is no longer responsible for fetching the original base file content.
-		return prop, true, nil
+		proposals = append(proposals, prop)
 	}
 
-	return nil, false, nil
+	if len(proposals) > 0 {
+		m.Logger.Info("Successfully extracted proposals from chunk", "proposal_count", len(proposals))
+	}
+
+	return proposals, nil
 }
 
 // BuildHistoryContents maps our generic Messages to the genai SDK types and injects the overlay

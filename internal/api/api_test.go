@@ -50,9 +50,9 @@ func (m *mockSessionService) SaveCompiledCache(ctx context.Context, firestoreCac
 
 type mockLLMManager struct {
 	CreateRepositoryCacheFunc  func(ctx context.Context, model string, files map[string]string, ttl time.Duration, explicitInstructions map[string]string) (string, error)
-	GenerateResponseFunc       func(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string) (*genai.GenerateContentResponse, error)
-	GenerateStreamResponseFunc func(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string) iter.Seq2[*genai.GenerateContentResponse, error]
-	InterceptToolCallFunc      func(ctx context.Context, chunk *genai.GenerateContentResponse, sessionID string) (*builder.ChangeProposal, bool, error)
+	GenerateResponseFunc       func(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string, extraHistory []*genai.Content) (*genai.GenerateContentResponse, error)
+	GenerateStreamResponseFunc func(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string, extraHistory []*genai.Content) iter.Seq2[*genai.GenerateContentResponse, error]
+	InterceptToolCallsFunc     func(ctx context.Context, chunk *genai.GenerateContentResponse, sessionID string) ([]*builder.ChangeProposal, error)
 }
 
 func (m *mockLLMManager) CreateRepositoryCache(ctx context.Context, model string, files map[string]string, ttl time.Duration, explicitInstructions map[string]string) (string, error) {
@@ -62,25 +62,25 @@ func (m *mockLLMManager) CreateRepositoryCache(ctx context.Context, model string
 	return "cache-123", nil
 }
 
-func (m *mockLLMManager) GenerateResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string) (*genai.GenerateContentResponse, error) {
+func (m *mockLLMManager) GenerateResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string, extraHistory []*genai.Content) (*genai.GenerateContentResponse, error) {
 	if m.GenerateResponseFunc != nil {
-		return m.GenerateResponseFunc(ctx, model, overlayPrompt, history, cacheID)
+		return m.GenerateResponseFunc(ctx, model, overlayPrompt, history, cacheID, extraHistory)
 	}
 	return &genai.GenerateContentResponse{}, nil
 }
 
-func (m *mockLLMManager) GenerateStreamResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string) iter.Seq2[*genai.GenerateContentResponse, error] {
+func (m *mockLLMManager) GenerateStreamResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string, extraHistory []*genai.Content) iter.Seq2[*genai.GenerateContentResponse, error] {
 	if m.GenerateStreamResponseFunc != nil {
-		return m.GenerateStreamResponseFunc(ctx, model, overlayPrompt, history, cacheID)
+		return m.GenerateStreamResponseFunc(ctx, model, overlayPrompt, history, cacheID, extraHistory)
 	}
 	return func(yield func(*genai.GenerateContentResponse, error) bool) {}
 }
 
-func (m *mockLLMManager) InterceptToolCall(ctx context.Context, chunk *genai.GenerateContentResponse, sessionID string) (*builder.ChangeProposal, bool, error) {
-	if m.InterceptToolCallFunc != nil {
-		return m.InterceptToolCallFunc(ctx, chunk, sessionID)
+func (m *mockLLMManager) InterceptToolCalls(ctx context.Context, chunk *genai.GenerateContentResponse, sessionID string) ([]*builder.ChangeProposal, error) {
+	if m.InterceptToolCallsFunc != nil {
+		return m.InterceptToolCallsFunc(ctx, chunk, sessionID)
 	}
-	return nil, false, nil
+	return nil, nil
 }
 
 func setupAPI() (*api.API, *mockSessionService, *mockFetcher, *mockLLMManager) {
@@ -104,17 +104,17 @@ func setupAPI() (*api.API, *mockSessionService, *mockFetcher, *mockLLMManager) {
 func TestGenerateStreamHandler_ToolInterception(t *testing.T) {
 	apiHandler, _, _, llmMgr := setupAPI()
 
-	llmMgr.InterceptToolCallFunc = func(ctx context.Context, chunk *genai.GenerateContentResponse, sessionID string) (*builder.ChangeProposal, bool, error) {
+	llmMgr.InterceptToolCallsFunc = func(ctx context.Context, chunk *genai.GenerateContentResponse, sessionID string) ([]*builder.ChangeProposal, error) {
 		prop := &builder.ChangeProposal{
 			ID:        "prop-123",
 			SessionID: sessionID,
 			FilePath:  "test.go",
 			Patch:     "@@ diff @@",
 		}
-		return prop, true, nil
+		return []*builder.ChangeProposal{prop}, nil
 	}
 
-	llmMgr.GenerateStreamResponseFunc = func(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string) iter.Seq2[*genai.GenerateContentResponse, error] {
+	llmMgr.GenerateStreamResponseFunc = func(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string, extraHistory []*genai.Content) iter.Seq2[*genai.GenerateContentResponse, error] {
 		return func(yield func(*genai.GenerateContentResponse, error) bool) {
 			dummyChunk := &genai.GenerateContentResponse{}
 			yield(dummyChunk, nil)

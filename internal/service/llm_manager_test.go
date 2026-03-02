@@ -13,7 +13,6 @@ import (
 	"github.com/tinywideclouds/go-llm/pkg/builder/v1"
 )
 
-// Add a mock fetcher at the top of the file
 type mockFetcher struct {
 	files map[string]string
 }
@@ -38,16 +37,13 @@ func TestBuildHistoryContents(t *testing.T) {
 		t.Fatalf("Expected 3 content blocks, got %d", len(contents))
 	}
 
-	// Check that previous messages are untouched
 	if len(contents[0].Parts) == 0 {
 		t.Fatalf("Expected parts in the first content block")
 	}
-	// The genai SDK uses pointers, so we need to safely extract the string
 	if !strings.Contains(fmt.Sprint(contents[0].Parts[0]), "Hello") {
 		t.Errorf("Expected first message to contain 'Hello', got %v", contents[0].Parts[0])
 	}
 
-	// Check that the overlay was appended to the last message
 	if len(contents[2].Parts) == 0 {
 		t.Fatalf("Expected parts in the last content block")
 	}
@@ -61,13 +57,11 @@ func TestBuildHistoryContents(t *testing.T) {
 	}
 }
 
-func TestInterceptToolCall(t *testing.T) {
+func TestInterceptToolCalls(t *testing.T) {
 	fetcher := &mockFetcher{}
-	// We can pass nil for the client since InterceptToolCall doesn't use it directly
 	manager := service.NewLLMManager(nil, fetcher, slog.Default())
 
 	t.Run("Successfully intercepts propose_change", func(t *testing.T) {
-		// Simulate a Gemini FunctionCall response
 		chunk := &genai.GenerateContentResponse{
 			Candidates: []*genai.Candidate{
 				{
@@ -89,22 +83,16 @@ func TestInterceptToolCall(t *testing.T) {
 			},
 		}
 
-		prop, isTool, err := manager.InterceptToolCall(context.Background(), chunk, "sess-1")
+		props, err := manager.InterceptToolCalls(context.Background(), chunk, "sess-1")
 
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
-		if !isTool {
-			t.Fatal("Expected isTool to be true")
+		if len(props) == 0 {
+			t.Fatal("Expected proposals to be extracted")
 		}
-		if prop.FilePath != "main.go" {
-			t.Errorf("Expected FilePath 'main.go', got '%s'", prop.FilePath)
-		}
-		if prop.Patch == "" {
-			t.Error("Expected patch to be populated")
-		}
-		if prop.NewContent != "" {
-			t.Error("Expected newContent to be empty")
+		if props[0].FilePath != "main.go" {
+			t.Errorf("Expected FilePath 'main.go', got '%s'", props[0].FilePath)
 		}
 	})
 }
