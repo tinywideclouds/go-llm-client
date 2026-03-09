@@ -14,9 +14,6 @@ import (
 	"github.com/tinywideclouds/go-llm/pkg/cache/v1"
 )
 
-// TestFirestoreFetcher_Integration requires the Firestore Emulator to be running.
-// It can be started via: `gcloud emulators firestore start --host-port=127.0.0.1:8080`
-// And run tests via: `FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 go test ./internal/store/...`
 func TestFirestoreFetcher_Integration(t *testing.T) {
 	emulatorHost := os.Getenv("FIRESTORE_EMULATOR_HOST")
 	if emulatorHost == "" {
@@ -29,12 +26,16 @@ func TestFirestoreFetcher_Integration(t *testing.T) {
 	defer client.Close()
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	fetcher := store.NewFirestoreFetcher(client, cache.StoreCollections{"bundle", "files", "profiles"}, logger)
+	fetcher := store.NewFirestoreFetcher(client, cache.StoreCollections{
+		BundleCollection:   "bundle",
+		FilesCollection:    "files",
+		ProfilesCollection: "profiles",
+	}, logger)
 
-	cacheID := "test-cache-123"
+	cacheID := mustURN("urn:llm:cache:test-cache-123")
 
 	// 1. Seed the Emulator Database
-	bundleRef := client.Collection("bundle").Doc(cacheID)
+	bundleRef := client.Collection("bundle").Doc(cacheID.String())
 	_, err = bundleRef.Set(ctx, map[string]string{"status": "ready"})
 	require.NoError(t, err)
 
@@ -52,7 +53,7 @@ func TestFirestoreFetcher_Integration(t *testing.T) {
 	require.NoError(t, err)
 
 	// 2. Execute the Fetcher (No Profile Filter)
-	files, err := fetcher.FetchCacheFiles(ctx, cacheID, "")
+	files, err := fetcher.FetchCacheFiles(ctx, cacheID, nil)
 	require.NoError(t, err)
 
 	// 3. Assertions

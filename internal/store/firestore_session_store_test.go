@@ -13,11 +13,18 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/tinywideclouds/go-llm-client/internal/store"
 	"github.com/tinywideclouds/go-llm/pkg/builder/v1"
+	urn "github.com/tinywideclouds/go-platform/pkg/net/v1"
 )
 
+func mustURN(s string) urn.URN {
+	u, err := urn.Parse(s)
+	if err != nil {
+		panic("invalid test URN: " + s)
+	}
+	return u
+}
+
 // TestFirestoreSessionStore_Integration requires the Firestore Emulator to be running.
-// It can be started via: `gcloud emulators firestore start --host-port=127.0.0.1:8080`
-// And run via: `FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 go test ./internal/store/...`
 func TestFirestoreSessionStore_Integration(t *testing.T) {
 	emulatorHost := os.Getenv("FIRESTORE_EMULATOR_HOST")
 	if emulatorHost == "" {
@@ -32,16 +39,15 @@ func TestFirestoreSessionStore_Integration(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	sessionStore := store.NewFirestoreSessionStore(client, "TestCacheBundles", logger)
 
-	baseCacheID := "base-bundle-123"
-	sessionID := "test-session-queue"
+	baseCacheID := mustURN("urn:llm:cache:base-bundle-123")
+	sessionID := mustURN("urn:llm:session:test-session-queue")
 
 	t.Run("Compiled Caches CRUD", func(t *testing.T) {
 		cc := &builder.CompiledCache{
-			ID:         "cc-999",
-			ExternalID: "cachedContents/gemini-abc",
-			Provider:   "gemini",
+			ID:       mustURN("urn:llm:compiled-cache:cc-999"),
+			Provider: "gemini",
 			AttachmentsUsed: []builder.Attachment{
-				{ID: "att-1", CacheID: baseCacheID},
+				{ID: mustURN("urn:llm:attachment:att-1"), CacheID: baseCacheID},
 			},
 			CreatedAt: time.Now().Truncate(time.Millisecond),
 		}
@@ -53,12 +59,13 @@ func TestFirestoreSessionStore_Integration(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, caches, 1)
 
-		assert.Equal(t, "cc-999", caches[0].ID)
-		assert.Equal(t, "cachedContents/gemini-abc", caches[0].ExternalID)
+		assert.Equal(t, mustURN("urn:llm:compiled-cache:cc-999"), caches[0].ID)
+		assert.Equal(t, builder.CompiledCacheProvider("gemini"), caches[0].Provider)
+		assert.Equal(t, mustURN("urn:llm:attachment:att-1"), caches[0].AttachmentsUsed[0].ID)
 	})
 
 	t.Run("Sessions GetOrCreate and Persistence", func(t *testing.T) {
-		testSessID := "test-session-456"
+		testSessID := mustURN("urn:llm:session:test-session-456")
 
 		// 1. Get Non-Existent
 		sess, err := sessionStore.GetSession(ctx, testSessID)
@@ -66,21 +73,21 @@ func TestFirestoreSessionStore_Integration(t *testing.T) {
 		assert.Equal(t, testSessID, sess.ID)
 
 		// 2. Mutate and Save
-		sess.CompiledCacheID = "cc-999"
+		sess.CompiledCacheID = mustURN("urn:llm:compiled-cache:cc-999")
 		err = sessionStore.SaveSession(ctx, sess)
 		require.NoError(t, err)
 
 		// 3. Fetch and Verify
 		fetched, err := sessionStore.GetSession(ctx, testSessID)
 		require.NoError(t, err)
-		assert.Equal(t, "cc-999", fetched.CompiledCacheID)
+		assert.Equal(t, mustURN("urn:llm:compiled-cache:cc-999"), fetched.CompiledCacheID)
 	})
 
 	t.Run("Ephemeral Queue Lifecycle", func(t *testing.T) {
 		propTime := time.Now().Truncate(time.Millisecond)
 
 		prop1 := &builder.ChangeProposal{
-			ID:         "prop-1",
+			ID:         "prop-1", // Ephemeral IDs remain strings across the boundary
 			SessionID:  sessionID,
 			FilePath:   "main.go",
 			NewContent: "package main",
@@ -106,7 +113,7 @@ func TestFirestoreSessionStore_Integration(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, queue, 2)
 
-		// 3. Delete Proposal (Simulate Accept/Reject)
+		// 3. Delete Proposal
 		err = sessionStore.DeleteProposal(ctx, sessionID, "prop-1")
 		require.NoError(t, err)
 

@@ -10,13 +10,23 @@ import (
 	"github.com/tinywideclouds/go-llm-client/internal/api"
 
 	"github.com/tinywideclouds/go-llm/pkg/builder/v1"
+	urn "github.com/tinywideclouds/go-platform/pkg/net/v1"
 )
+
+func mustURN(s string) urn.URN {
+	u, err := urn.Parse(s)
+	if err != nil {
+		panic("invalid test URN: " + s)
+	}
+	return u
+}
 
 type mockFetcher struct {
 	files map[string]string
 }
 
-func (m *mockFetcher) FetchCacheFiles(ctx context.Context, cacheID, profileID string) (map[string]string, error) {
+// Updated to match the strict Fetcher interface
+func (m *mockFetcher) FetchCacheFiles(ctx context.Context, cacheID urn.URN, profileID *urn.URN) (map[string]string, error) {
 	return m.files, nil
 }
 func (m *mockFetcher) Close() error { return nil }
@@ -30,7 +40,10 @@ func TestBuildInlineContext(t *testing.T) {
 		},
 	}
 
-	attachments := []builder.Attachment{{CacheID: "cache-1"}}
+	attachments := []builder.Attachment{
+		{CacheID: mustURN("urn:llm:cache:1")},
+	}
+
 	result := api.BuildInlineContext(context.Background(), fetcher, attachments, logger)
 
 	assert.Contains(t, result, `<file path="main.go">`)

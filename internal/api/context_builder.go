@@ -10,6 +10,7 @@ import (
 )
 
 // BuildInlineContext fetches the files for the given attachments and formats them into an XML string.
+// It directly accepts strict URN domain types from the builder.Attachment array.
 func BuildInlineContext(ctx context.Context, fetcher store.Fetcher, attachments []builder.Attachment, logger *slog.Logger) string {
 	if len(attachments) == 0 {
 		return ""
@@ -17,9 +18,10 @@ func BuildInlineContext(ctx context.Context, fetcher store.Fetcher, attachments 
 
 	inlineContext := ""
 	for _, att := range attachments {
+		// att.CacheID and att.ProfileID are native urn.URN and *urn.URN
 		files, err := fetcher.FetchCacheFiles(ctx, att.CacheID, att.ProfileID)
 		if err != nil {
-			logger.Warn("Failed to fetch inline attachment, skipping", "cacheId", att.CacheID, "error", err)
+			logger.Warn("Failed to fetch inline attachment, skipping", "cacheId", att.CacheID.String(), "error", err)
 			continue
 		}
 		for path, content := range files {

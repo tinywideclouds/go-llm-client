@@ -10,13 +10,12 @@ import (
 
 	"github.com/tinywideclouds/go-llm/pkg/cache/v1"
 	"github.com/tinywideclouds/go-llm/pkg/yaml/filter"
+	urn "github.com/tinywideclouds/go-platform/pkg/net/v1"
 )
 
 // Fetcher defines the contract for retrieving context from the database.
 type Fetcher interface {
-	// FetchCacheFiles retrieves all text content for a given cache, optionally filtered by a profile.
-	// Returns a map where the key is the file path and the value is the raw file content.
-	FetchCacheFiles(ctx context.Context, cacheID, profileID string) (map[string]string, error)
+	FetchCacheFiles(ctx context.Context, cacheID urn.URN, profileID *urn.URN) (map[string]string, error)
 	Close() error
 }
 
@@ -26,7 +25,6 @@ type FirestoreFetcher struct {
 	logger           *slog.Logger
 }
 
-// NewFirestoreFetcher initializes the database client for the LLM service.
 func NewFirestoreFetcher(client *firestore.Client, storeCollections cache.StoreCollections, logger *slog.Logger) *FirestoreFetcher {
 	return &FirestoreFetcher{
 		client:           client,
@@ -40,17 +38,18 @@ func (f *FirestoreFetcher) Close() error {
 	return f.client.Close()
 }
 
-func (f *FirestoreFetcher) FetchCacheFiles(ctx context.Context, cacheID, profileID string) (map[string]string, error) {
-	f.logger.Info("Fetching cache files", "cacheID", cacheID, "profileID", profileID)
+func (f *FirestoreFetcher) FetchCacheFiles(ctx context.Context, cacheID urn.URN, profileID *urn.URN) (map[string]string, error) {
+	f.logger.Info("Fetching cache files", "cacheID", cacheID.String())
 
 	var activeRules *filter.FilterRules
 
 	// 1. If a ProfileID is provided, fetch and parse its rules first
-	if profileID != "" {
-		profileRef := f.client.Collection(f.storeCollections.BundleCollection).Doc(cacheID).Collection(f.storeCollections.ProfilesCollection).Doc(profileID)
+	if profileID != nil {
+		f.logger.Info("Using profile for fetching", "profileID", profileID.String())
+		profileRef := f.client.Collection(f.storeCollections.BundleCollection).Doc(cacheID.String()).Collection(f.storeCollections.ProfilesCollection).Doc(profileID.String())
 		doc, err := profileRef.Get(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("failed to retrieve profile %s: %w", profileID, err)
+			return nil, fmt.Errorf("failed to retrieve profile %s: %w", profileID.String(), err)
 		}
 
 		var profileData struct {
@@ -70,7 +69,7 @@ func (f *FirestoreFetcher) FetchCacheFiles(ctx context.Context, cacheID, profile
 
 	// 2. Stream the files and apply the filter in-memory
 	filesMap := make(map[string]string)
-	filesRef := f.client.Collection(f.storeCollections.BundleCollection).Doc(cacheID).Collection(f.storeCollections.FilesCollection)
+	filesRef := f.client.Collection(f.storeCollections.BundleCollection).Doc(cacheID.String()).Collection(f.storeCollections.FilesCollection)
 	iter := filesRef.Documents(ctx)
 
 	for {
@@ -93,12 +92,12 @@ func (f *FirestoreFetcher) FetchCacheFiles(ctx context.Context, cacheID, profile
 
 		// 3. Apply the Profile Filter (if one exists)
 		if activeRules != nil && !activeRules.Match(fileData.Path) {
-			continue // Skip this file, it doesn't match the LLM context profile
+			continue
 		}
 
 		filesMap[fileData.Path] = fileData.Content
 	}
 
-	f.logger.Info("Successfully fetched context files", "cacheID", cacheID, "total_files_loaded", len(filesMap))
+	f.logger.Info("Successfully fetched context files", "cacheID", cacheID.String(), "total_files_loaded", len(filesMap))
 	return filesMap, nil
 }

@@ -13,6 +13,7 @@ import (
 
 	"github.com/tinywideclouds/go-llm-client/internal/api"
 	"github.com/tinywideclouds/go-llm/pkg/builder/v1"
+	urn "github.com/tinywideclouds/go-platform/pkg/net/v1"
 
 	"google.golang.org/genai"
 )
@@ -25,18 +26,18 @@ type mockSessionService struct {
 	proposals []builder.ChangeProposal
 }
 
-func (m *mockSessionService) GetSession(ctx context.Context, sessionID string) (*builder.Session, error) {
+func (m *mockSessionService) GetSession(ctx context.Context, sessionID urn.URN) (*builder.Session, error) {
 	if m.session != nil {
 		return m.session, nil
 	}
 	return &builder.Session{}, nil
 }
 
-func (m *mockSessionService) RemoveProposal(ctx context.Context, sessionID, proposalID string) error {
+func (m *mockSessionService) RemoveProposal(ctx context.Context, sessionID urn.URN, proposalID string) error {
 	return m.acceptErr
 }
 
-func (m *mockSessionService) ListProposalsBySession(ctx context.Context, sessionID string) ([]builder.ChangeProposal, error) {
+func (m *mockSessionService) ListProposalsBySession(ctx context.Context, sessionID urn.URN) ([]builder.ChangeProposal, error) {
 	return m.proposals, nil
 }
 
@@ -44,39 +45,39 @@ func (m *mockSessionService) CreateProposal(ctx context.Context, proposal *build
 	return nil
 }
 
-func (m *mockSessionService) SaveCompiledCache(ctx context.Context, firestoreCacheID string, cache *builder.CompiledCache) error {
+func (m *mockSessionService) SaveCompiledCache(ctx context.Context, firestoreCacheID urn.URN, cache *builder.CompiledCache) error {
 	return nil
 }
 
 type mockLLMManager struct {
-	CreateRepositoryCacheFunc  func(ctx context.Context, model string, files map[string]string, ttl time.Duration, explicitInstructions map[string]string) (string, error)
-	GenerateResponseFunc       func(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string, extraHistory []*genai.Content) (*genai.GenerateContentResponse, error)
-	GenerateStreamResponseFunc func(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string, extraHistory []*genai.Content) iter.Seq2[*genai.GenerateContentResponse, error]
-	InterceptToolCallsFunc     func(ctx context.Context, chunk *genai.GenerateContentResponse, sessionID string) ([]*builder.ChangeProposal, error)
+	CreateRepositoryCacheFunc  func(ctx context.Context, model string, files map[string]string, ttl time.Duration, explicitInstructions map[string]string) (urn.URN, error)
+	GenerateResponseFunc       func(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID *urn.URN, extraHistory []*genai.Content) (*genai.GenerateContentResponse, error)
+	GenerateStreamResponseFunc func(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID *urn.URN, extraHistory []*genai.Content) iter.Seq2[*genai.GenerateContentResponse, error]
+	InterceptToolCallsFunc     func(ctx context.Context, chunk *genai.GenerateContentResponse, sessionID urn.URN) ([]*builder.ChangeProposal, error)
 }
 
-func (m *mockLLMManager) CreateRepositoryCache(ctx context.Context, model string, files map[string]string, ttl time.Duration, explicitInstructions map[string]string) (string, error) {
+func (m *mockLLMManager) CreateRepositoryCache(ctx context.Context, model string, files map[string]string, ttl time.Duration, explicitInstructions map[string]string) (urn.URN, error) {
 	if m.CreateRepositoryCacheFunc != nil {
 		return m.CreateRepositoryCacheFunc(ctx, model, files, ttl, explicitInstructions)
 	}
-	return "cache-123", nil
+	return mustURN("urn:llm:compiled-cache:gemini-123"), nil
 }
 
-func (m *mockLLMManager) GenerateResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string, extraHistory []*genai.Content) (*genai.GenerateContentResponse, error) {
+func (m *mockLLMManager) GenerateResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID *urn.URN, extraHistory []*genai.Content) (*genai.GenerateContentResponse, error) {
 	if m.GenerateResponseFunc != nil {
 		return m.GenerateResponseFunc(ctx, model, overlayPrompt, history, cacheID, extraHistory)
 	}
 	return &genai.GenerateContentResponse{}, nil
 }
 
-func (m *mockLLMManager) GenerateStreamResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string, extraHistory []*genai.Content) iter.Seq2[*genai.GenerateContentResponse, error] {
+func (m *mockLLMManager) GenerateStreamResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID *urn.URN, extraHistory []*genai.Content) iter.Seq2[*genai.GenerateContentResponse, error] {
 	if m.GenerateStreamResponseFunc != nil {
 		return m.GenerateStreamResponseFunc(ctx, model, overlayPrompt, history, cacheID, extraHistory)
 	}
 	return func(yield func(*genai.GenerateContentResponse, error) bool) {}
 }
 
-func (m *mockLLMManager) InterceptToolCalls(ctx context.Context, chunk *genai.GenerateContentResponse, sessionID string) ([]*builder.ChangeProposal, error) {
+func (m *mockLLMManager) InterceptToolCalls(ctx context.Context, chunk *genai.GenerateContentResponse, sessionID urn.URN) ([]*builder.ChangeProposal, error) {
 	if m.InterceptToolCallsFunc != nil {
 		return m.InterceptToolCallsFunc(ctx, chunk, sessionID)
 	}
@@ -93,6 +94,7 @@ func setupAPI() (*api.API, *mockSessionService, *mockFetcher, *mockLLMManager) {
 		SessionService: sessionSvc,
 		LLM:            llmMgr,
 		Fetcher:        fetcher,
+		CachePolicy:    api.NewCachePolicy(),
 		Logger:         logger,
 	}
 
@@ -104,7 +106,7 @@ func setupAPI() (*api.API, *mockSessionService, *mockFetcher, *mockLLMManager) {
 func TestGenerateStreamHandler_ToolInterception(t *testing.T) {
 	apiHandler, _, _, llmMgr := setupAPI()
 
-	llmMgr.InterceptToolCallsFunc = func(ctx context.Context, chunk *genai.GenerateContentResponse, sessionID string) ([]*builder.ChangeProposal, error) {
+	llmMgr.InterceptToolCallsFunc = func(ctx context.Context, chunk *genai.GenerateContentResponse, sessionID urn.URN) ([]*builder.ChangeProposal, error) {
 		prop := &builder.ChangeProposal{
 			ID:        "prop-123",
 			SessionID: sessionID,
@@ -114,14 +116,15 @@ func TestGenerateStreamHandler_ToolInterception(t *testing.T) {
 		return []*builder.ChangeProposal{prop}, nil
 	}
 
-	llmMgr.GenerateStreamResponseFunc = func(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string, extraHistory []*genai.Content) iter.Seq2[*genai.GenerateContentResponse, error] {
+	llmMgr.GenerateStreamResponseFunc = func(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID *urn.URN, extraHistory []*genai.Content) iter.Seq2[*genai.GenerateContentResponse, error] {
 		return func(yield func(*genai.GenerateContentResponse, error) bool) {
 			dummyChunk := &genai.GenerateContentResponse{}
 			yield(dummyChunk, nil)
 		}
 	}
 
-	reqBody := `{"sessionId": "sess-1", "history": [{"role": "user", "content": "Update the file"}]}`
+	// Use valid strict URN formatting for the request body
+	reqBody := `{"sessionId": "urn:llm:session:sess-1", "history": [{"role": "user", "content": "Update the file"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/llm/generate-stream", strings.NewReader(reqBody))
 
 	w := httptest.NewRecorder()

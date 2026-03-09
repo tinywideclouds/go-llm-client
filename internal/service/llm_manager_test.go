@@ -2,78 +2,48 @@ package service_test
 
 import (
 	"context"
-	"fmt"
+	"io"
 	"log/slog"
-	"strings"
 	"testing"
 
-	"google.golang.org/genai"
-
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/tinywideclouds/go-llm-client/internal/service"
 	"github.com/tinywideclouds/go-llm/pkg/builder/v1"
+	urn "github.com/tinywideclouds/go-platform/pkg/net/v1"
+
+	"google.golang.org/genai"
 )
 
-type mockFetcher struct {
-	files map[string]string
+func mustURN(s string) urn.URN {
+	u, err := urn.Parse(s)
+	if err != nil {
+		panic("invalid test URN: " + s)
+	}
+	return u
 }
 
-func (m *mockFetcher) FetchCacheFiles(ctx context.Context, cacheID, profileID string) (map[string]string, error) {
-	return m.files, nil
-}
-func (m *mockFetcher) Close() error { return nil }
+func TestLLMManager_InterceptToolCalls(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	// Pass nil for genai.Client and store.Fetcher since InterceptToolCalls is a pure function
+	manager := service.NewLLMManager(nil, nil, logger)
 
-func TestBuildHistoryContents(t *testing.T) {
-	history := []builder.Message{
-		{Role: "user", Content: "Hello"},
-		{Role: "model", Content: "Hi there"},
-		{Role: "user", Content: "Fix this code"},
-	}
+	sessionID := mustURN("urn:llm:session:123")
 
-	overlay := "<system_note>unsaved changes</system_note>"
-
-	contents := service.BuildHistoryContents(history, overlay)
-
-	if len(contents) != 3 {
-		t.Fatalf("Expected 3 content blocks, got %d", len(contents))
-	}
-
-	if len(contents[0].Parts) == 0 {
-		t.Fatalf("Expected parts in the first content block")
-	}
-	if !strings.Contains(fmt.Sprint(contents[0].Parts[0]), "Hello") {
-		t.Errorf("Expected first message to contain 'Hello', got %v", contents[0].Parts[0])
-	}
-
-	if len(contents[2].Parts) == 0 {
-		t.Fatalf("Expected parts in the last content block")
-	}
-	lastText := fmt.Sprint(contents[2].Parts[0])
-
-	if !strings.Contains(lastText, overlay) {
-		t.Error("Expected overlay to be injected into the final user message")
-	}
-	if !strings.Contains(lastText, "User Query: Fix this code") {
-		t.Error("Expected final message content to be preserved after overlay")
-	}
-}
-
-func TestInterceptToolCalls(t *testing.T) {
-	fetcher := &mockFetcher{}
-	manager := service.NewLLMManager(nil, fetcher, slog.Default())
-
-	t.Run("Successfully intercepts propose_change", func(t *testing.T) {
+	t.Run("Extracts propose_change properly mapping URNs", func(t *testing.T) {
 		chunk := &genai.GenerateContentResponse{
 			Candidates: []*genai.Candidate{
 				{
 					Content: &genai.Content{
 						Parts: []*genai.Part{
+							{Text: "I will make the change now."},
 							{
 								FunctionCall: &genai.FunctionCall{
 									Name: "propose_change",
 									Args: map[string]any{
 										"file_path": "main.go",
-										"patch":     "@@ -1,3 +1,4 @@\n package main\n+\n+import \"fmt\"\n \n func main() {}",
-										"reasoning": "Added fmt import",
+										"patch":     "@@ -1,3 +1,4 @@",
+										"reasoning": "Adding a print statement",
 									},
 								},
 							},
@@ -83,16 +53,54 @@ func TestInterceptToolCalls(t *testing.T) {
 			},
 		}
 
-		props, err := manager.InterceptToolCalls(context.Background(), chunk, "sess-1")
+		proposals, err := manager.InterceptToolCalls(context.Background(), chunk, sessionID)
+		require.NoError(t, err)
+		require.Len(t, proposals, 1)
 
-		if err != nil {
-			t.Fatalf("Unexpected error: %v", err)
-		}
-		if len(props) == 0 {
-			t.Fatal("Expected proposals to be extracted")
-		}
-		if props[0].FilePath != "main.go" {
-			t.Errorf("Expected FilePath 'main.go', got '%s'", props[0].FilePath)
-		}
+		prop := proposals[0]
+		assert.Equal(t, sessionID, prop.SessionID) // Verify strict URN mapping
+		assert.Equal(t, "main.go", prop.FilePath)
+		assert.Equal(t, "@@ -1,3 +1,4 @@", prop.Patch)
+		assert.Equal(t, "Adding a print statement", prop.Reasoning)
+		assert.NotEmpty(t, prop.ID) // Ephemeral string ID should be generated
 	})
+
+	t.Run("Ignores chunks without function calls", func(t *testing.T) {
+		chunk := &genai.GenerateContentResponse{
+			Candidates: []*genai.Candidate{
+				{
+					Content: &genai.Content{
+						Parts: []*genai.Part{
+							{Text: "Just a standard text response"},
+						},
+					},
+				},
+			},
+		}
+
+		proposals, err := manager.InterceptToolCalls(context.Background(), chunk, sessionID)
+		require.NoError(t, err)
+		assert.Empty(t, proposals)
+	})
+}
+
+func TestLLMManager_BuildHistoryContents(t *testing.T) {
+	history := []builder.Message{
+		{Role: "user", Content: "Hello"},
+		{Role: "model", Content: "Hi there"},
+		{Role: "user", Content: "Make a change"},
+	}
+
+	overlay := "<system_note>Pending files...</system_note>"
+
+	contents := service.BuildHistoryContents(history, overlay)
+	require.Len(t, contents, 3)
+
+	assert.Equal(t, "user", contents[0].Role)
+	assert.Equal(t, "Hello", contents[0].Parts[0].Text)
+
+	// Verify overlay is injected ONLY into the final user message
+	assert.Equal(t, "user", contents[2].Role)
+	assert.Contains(t, contents[2].Parts[0].Text, "<system_note>Pending files...</system_note>")
+	assert.Contains(t, contents[2].Parts[0].Text, "Make a change")
 }

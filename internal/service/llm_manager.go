@@ -5,21 +5,37 @@ import (
 	"fmt"
 	"iter"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/tinywideclouds/go-llm-client/internal/store"
 	"github.com/tinywideclouds/go-llm/pkg/builder/v1"
+	urn "github.com/tinywideclouds/go-platform/pkg/net/v1"
 
 	"google.golang.org/genai"
 )
 
+// extractGeminiCacheName strips the URN formatting to yield the raw GenAI cache name
+// e.g., "urn:llm:compiled-cache:cachedContents/123" -> "cachedContents/123"
+func extractGeminiCacheName(u *urn.URN) string {
+	if u == nil {
+		return ""
+	}
+	str := u.String()
+	parts := strings.SplitN(str, ":", 4)
+	if len(parts) == 4 {
+		return parts[3]
+	}
+	return str
+}
+
 type LLMManager interface {
-	CreateRepositoryCache(ctx context.Context, model string, files map[string]string, ttl time.Duration, explicitInstructions map[string]string) (string, error)
-	GenerateResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string, extraHistory []*genai.Content) (*genai.GenerateContentResponse, error)
-	GenerateStreamResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string, extraHistory []*genai.Content) iter.Seq2[*genai.GenerateContentResponse, error]
+	CreateRepositoryCache(ctx context.Context, model string, files map[string]string, ttl time.Duration, explicitInstructions map[string]string) (urn.URN, error)
+	GenerateResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID *urn.URN, extraHistory []*genai.Content) (*genai.GenerateContentResponse, error)
+	GenerateStreamResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID *urn.URN, extraHistory []*genai.Content) iter.Seq2[*genai.GenerateContentResponse, error]
 
 	// Tool Interception - Pure stateless parser
-	InterceptToolCalls(ctx context.Context, chunk *genai.GenerateContentResponse, sessionID string) ([]*builder.ChangeProposal, error)
+	InterceptToolCalls(ctx context.Context, chunk *genai.GenerateContentResponse, sessionID urn.URN) ([]*builder.ChangeProposal, error)
 }
 
 type geminiManager struct {
@@ -37,7 +53,7 @@ func NewLLMManager(client *genai.Client, fetcher store.Fetcher, logger *slog.Log
 }
 
 // CreateRepositoryCache uploads the entire file map to Google's caching infrastructure.
-func (m *geminiManager) CreateRepositoryCache(ctx context.Context, model string, files map[string]string, ttl time.Duration, explicitInstructions map[string]string) (string, error) {
+func (m *geminiManager) CreateRepositoryCache(ctx context.Context, model string, files map[string]string, ttl time.Duration, explicitInstructions map[string]string) (urn.URN, error) {
 	m.Logger.Info("Building Gemini Cache", "file_count", len(files), "ttl", ttl)
 
 	var codebaseParts []*genai.Part
@@ -67,21 +83,29 @@ func (m *geminiManager) CreateRepositoryCache(ctx context.Context, model string,
 	config := &genai.CreateCachedContentConfig{
 		Contents:          contents,
 		SystemInstruction: sysInst,
+		Tools:             GetWorkspaceTools(),
 		TTL:               ttl,
 		DisplayName:       "repo-cache-" + time.Now().Format("20060102150405"),
 	}
 
 	createdCache, err := m.client.Caches.Create(ctx, model, config)
 	if err != nil {
-		return "", fmt.Errorf("failed to create context cache on Google servers: %w", err)
+		return urn.URN{}, fmt.Errorf("failed to create context cache on Google servers: %w", err)
 	}
 
 	m.Logger.Info("Gemini Cache created successfully", "cache_name", createdCache.Name)
-	return createdCache.Name, nil
+
+	cacheURNStr := fmt.Sprintf("urn:llm:compiled-cache:%s", createdCache.Name)
+	cacheURN, err := urn.Parse(cacheURNStr)
+	if err != nil {
+		return urn.URN{}, fmt.Errorf("failed to parse generated cache name into URN: %w", err)
+	}
+
+	return cacheURN, nil
 }
 
 // GenerateResponse generates a single blocking response utilizing the cache if provided.
-func (m *geminiManager) GenerateResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string, extraHistory []*genai.Content) (*genai.GenerateContentResponse, error) {
+func (m *geminiManager) GenerateResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID *urn.URN, extraHistory []*genai.Content) (*genai.GenerateContentResponse, error) {
 	contents := BuildHistoryContents(history, overlayPrompt)
 	if len(extraHistory) > 0 {
 		contents = append(contents, extraHistory...)
@@ -91,34 +115,38 @@ func (m *geminiManager) GenerateResponse(ctx context.Context, model string, over
 		Tools: GetWorkspaceTools(),
 	}
 
-	if cacheID != "" {
-		config.CachedContent = cacheID
-		m.Logger.Debug("Using Gemini Context Cache for generation", "cache_name", cacheID)
+	if cacheID != nil {
+		geminiName := extractGeminiCacheName(cacheID)
+		config.CachedContent = geminiName
+		m.Logger.Debug("Using Gemini Context Cache for generation", "cache_name", geminiName)
 	}
 
 	return m.client.Models.GenerateContent(ctx, model, contents, config)
 }
 
 // GenerateStreamResponse streams the generation back utilizing the cache if provided.
-func (m *geminiManager) GenerateStreamResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID string, extraHistory []*genai.Content) iter.Seq2[*genai.GenerateContentResponse, error] {
+func (m *geminiManager) GenerateStreamResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID *urn.URN, extraHistory []*genai.Content) iter.Seq2[*genai.GenerateContentResponse, error] {
 	contents := BuildHistoryContents(history, overlayPrompt)
 	if len(extraHistory) > 0 {
 		contents = append(contents, extraHistory...)
 	}
 
-	config := &genai.GenerateContentConfig{
-		Tools: GetWorkspaceTools(),
-	}
+	config := &genai.GenerateContentConfig{}
 
-	if cacheID != "" {
-		config.CachedContent = cacheID
-		m.Logger.Debug("Using Gemini Context Cache for stream generation", "cache_name", cacheID)
+	if cacheID != nil {
+		geminiName := extractGeminiCacheName(cacheID)
+		config.CachedContent = geminiName
+		// DO NOT set config.Tools here if cacheID is present to avoid GenAI HTTP 400 errors
+		m.Logger.Debug("Using Gemini Context Cache for stream generation", "cache_name", geminiName)
+	} else {
+		// Only set tools for non-cached "fallback" calls
+		config.Tools = GetWorkspaceTools()
 	}
 
 	return m.client.Models.GenerateContentStream(ctx, model, contents, config)
 }
 
-func (m *geminiManager) InterceptToolCalls(ctx context.Context, chunk *genai.GenerateContentResponse, sessionID string) ([]*builder.ChangeProposal, error) {
+func (m *geminiManager) InterceptToolCalls(ctx context.Context, chunk *genai.GenerateContentResponse, sessionID urn.URN) ([]*builder.ChangeProposal, error) {
 	var proposals []*builder.ChangeProposal
 
 	if len(chunk.Candidates) == 0 || chunk.Candidates[0].Content == nil {
@@ -143,7 +171,7 @@ func (m *geminiManager) InterceptToolCalls(ctx context.Context, chunk *genai.Gen
 
 		prop := &builder.ChangeProposal{
 			ID:         fmt.Sprintf("prop-%d", time.Now().UnixNano()),
-			SessionID:  sessionID,
+			SessionID:  sessionID, // Strictly assigned as urn.URN
 			FilePath:   filePath,
 			Patch:      patch,
 			NewContent: newContent,
