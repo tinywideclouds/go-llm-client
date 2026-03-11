@@ -11,7 +11,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tinywideclouds/go-llm-client/internal/store"
-	"github.com/tinywideclouds/go-llm/pkg/cache/v1"
 )
 
 func TestFirestoreFetcher_Integration(t *testing.T) {
@@ -26,7 +25,7 @@ func TestFirestoreFetcher_Integration(t *testing.T) {
 	defer client.Close()
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	fetcher := store.NewFirestoreFetcher(client, cache.StoreCollections{
+	fetcher := store.NewFirestoreFetcher(client, store.StoreCollections{
 		BundleCollection:   "bundle",
 		FilesCollection:    "files",
 		ProfilesCollection: "profiles",

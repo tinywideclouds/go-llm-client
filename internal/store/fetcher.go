@@ -8,10 +8,15 @@ import (
 	"cloud.google.com/go/firestore"
 	"google.golang.org/api/iterator"
 
-	"github.com/tinywideclouds/go-llm/pkg/cache/v1"
-	"github.com/tinywideclouds/go-llm/pkg/yaml/filter"
+	"github.com/tinywideclouds/go-data-sources/pkg/yaml"
 	urn "github.com/tinywideclouds/go-platform/pkg/net/v1"
 )
+
+type StoreCollections struct {
+	BundleCollection   string
+	FilesCollection    string
+	ProfilesCollection string
+}
 
 // Fetcher defines the contract for retrieving context from the database.
 type Fetcher interface {
@@ -21,11 +26,11 @@ type Fetcher interface {
 
 type FirestoreFetcher struct {
 	client           *firestore.Client
-	storeCollections cache.StoreCollections
+	storeCollections StoreCollections
 	logger           *slog.Logger
 }
 
-func NewFirestoreFetcher(client *firestore.Client, storeCollections cache.StoreCollections, logger *slog.Logger) *FirestoreFetcher {
+func NewFirestoreFetcher(client *firestore.Client, storeCollections StoreCollections, logger *slog.Logger) *FirestoreFetcher {
 	return &FirestoreFetcher{
 		client:           client,
 		storeCollections: storeCollections,
@@ -41,7 +46,7 @@ func (f *FirestoreFetcher) Close() error {
 func (f *FirestoreFetcher) FetchCacheFiles(ctx context.Context, cacheID urn.URN, profileID *urn.URN) (map[string]string, error) {
 	f.logger.Info("Fetching cache files", "cacheID", cacheID.String())
 
-	var activeRules *filter.FilterRules
+	var activeRules *yaml.FilterRules
 
 	// 1. If a ProfileID is provided, fetch and parse its rules first
 	if profileID != nil {
@@ -59,7 +64,7 @@ func (f *FirestoreFetcher) FetchCacheFiles(ctx context.Context, cacheID urn.URN,
 			return nil, fmt.Errorf("failed to parse profile data: %w", err)
 		}
 
-		rules, err := filter.ParseYAML(profileData.RulesYaml)
+		rules, err := yaml.ParseYAML(profileData.RulesYaml)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse profile rules yaml: %w", err)
 		}

@@ -36,18 +36,18 @@ func (a *API) BuildCompiledCacheHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if len(req.Attachments) == 0 {
+	if len(req.Sources) == 0 {
 		response.WriteJSONError(w, http.StatusBadRequest, "At least one attachment is required to build a cache")
 		return
 	}
 
 	allFiles := make(map[string]string)
-	for _, att := range req.Attachments {
-		// No need to check for empty CacheID anymore, JSON unmarshaling guarantees valid URNs
+	for _, att := range req.Sources {
+		// No need to check for empty DataSourceID anymore, JSON unmarshaling guarantees valid URNs
 
-		files, err := a.Fetcher.FetchCacheFiles(r.Context(), att.CacheID, att.ProfileID)
+		files, err := a.Fetcher.FetchCacheFiles(r.Context(), att.DataSourceID, att.ProfileID)
 		if err != nil {
-			a.Logger.Error("Failed to fetch cache files", "cacheId", att.CacheID.String(), "error", err)
+			a.Logger.Error("Failed to fetch cache files", "DataSourceID", att.DataSourceID.String(), "error", err)
 			response.WriteJSONError(w, http.StatusInternalServerError, "Failed to retrieve context data from database")
 			return
 		}
@@ -81,15 +81,15 @@ func (a *API) BuildCompiledCacheHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	baseCacheID := req.Attachments[0].CacheID
+	baseCacheID := req.Sources[0].DataSourceID
 
 	// ExternalID is gone. We assign the returned cache URN directly to ID.
 	compiledCache := &builder.CompiledCache{
-		ID:              compiledCacheURN,
-		Provider:        "gemini",
-		AttachmentsUsed: req.Attachments,
-		CreatedAt:       time.Now(),
-		ExpiresAt:       expires,
+		ID:        compiledCacheURN,
+		Provider:  "gemini",
+		Sources:   req.Sources,
+		CreatedAt: time.Now(),
+		ExpiresAt: expires,
 	}
 
 	if err := a.SessionService.SaveCompiledCache(r.Context(), baseCacheID, compiledCache); err != nil {

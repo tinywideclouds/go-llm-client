@@ -54,11 +54,11 @@ type firestoreCache struct {
 
 func (s *FirestoreSessionStore) SaveCompiledCache(ctx context.Context, firestoreCacheID urn.URN, cache *builder.CompiledCache) error {
 
-	fsAttachments := make([]firestoreAttachment, 0, len(cache.AttachmentsUsed))
-	for _, att := range cache.AttachmentsUsed {
+	fsAttachments := make([]firestoreAttachment, 0, len(cache.Sources))
+	for _, att := range cache.Sources {
 		fsAtt := firestoreAttachment{
 			ID:      att.ID.String(),
-			CacheID: att.CacheID.String(),
+			CacheID: att.DataSourceID.String(),
 		}
 		if att.ProfileID != nil {
 			pid := att.ProfileID.String()
@@ -124,14 +124,14 @@ func (s *FirestoreSessionStore) ListCompiledCaches(ctx context.Context, firestor
 			attID, _ := urn.Parse(att.ID)
 			cacheID, _ := urn.Parse(att.CacheID)
 			domainAtt := builder.Attachment{
-				ID:      attID,
-				CacheID: cacheID,
+				ID:           attID,
+				DataSourceID: cacheID,
 			}
 			if att.ProfileID != nil {
 				pid, _ := urn.Parse(*att.ProfileID)
 				domainAtt.ProfileID = &pid
 			}
-			c.AttachmentsUsed = append(c.AttachmentsUsed, domainAtt)
+			c.Sources = append(c.Sources, domainAtt)
 		}
 
 		caches = append(caches, c)

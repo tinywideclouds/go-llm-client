@@ -19,9 +19,9 @@ func BuildInlineContext(ctx context.Context, fetcher store.Fetcher, attachments 
 	inlineContext := ""
 	for _, att := range attachments {
 		// att.CacheID and att.ProfileID are native urn.URN and *urn.URN
-		files, err := fetcher.FetchCacheFiles(ctx, att.CacheID, att.ProfileID)
+		files, err := fetcher.FetchCacheFiles(ctx, att.DataSourceID, att.ProfileID)
 		if err != nil {
-			logger.Warn("Failed to fetch inline attachment, skipping", "cacheId", att.CacheID.String(), "error", err)
+			logger.Warn("Failed to fetch inline attachment, skipping", "cacheId", att.DataSourceID.String(), "error", err)
 			continue
 		}
 		for path, content := range files {
