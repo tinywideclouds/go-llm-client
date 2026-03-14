@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -12,10 +13,14 @@ import (
 	urn "github.com/tinywideclouds/go-platform/pkg/net/v1"
 )
 
+// ErrContextTooLarge is returned when the fetched files exceed the safety memory limits.
+var ErrContextTooLarge = errors.New("firestore context exceeds memory limit")
+
 type StoreCollections struct {
 	BundleCollection   string
 	FilesCollection    string
 	ProfilesCollection string
+	MaxFetchBytes      int64 // Limit to prevent OOM errors during fetch
 }
 
 // Fetcher defines the contract for retrieving context from the database.
@@ -72,7 +77,14 @@ func (f *FirestoreFetcher) FetchCacheFiles(ctx context.Context, cacheID urn.URN,
 		f.logger.Debug("Loaded filter profile", "includes", len(rules.Include), "excludes", len(rules.Exclude))
 	}
 
-	// 2. Stream the files and apply the filter in-memory
+	// Calculate maximum allowed bytes (default to 100MB if not specified)
+	limit := f.storeCollections.MaxFetchBytes
+	if limit <= 0 {
+		limit = 100 * 1024 * 1024 // 100 MB
+	}
+	var currentBytes int64
+
+	// 2. Stream the files and apply the filter in-memory safely
 	filesMap := make(map[string]string)
 	filesRef := f.client.Collection(f.storeCollections.BundleCollection).Doc(cacheID.String()).Collection(f.storeCollections.FilesCollection)
 	iter := filesRef.Documents(ctx)
@@ -100,9 +112,17 @@ func (f *FirestoreFetcher) FetchCacheFiles(ctx context.Context, cacheID urn.URN,
 			continue
 		}
 
+		// 4. Memory Safety Guard
+		fileSize := int64(len(fileData.Path) + len(fileData.Content))
+		if currentBytes+fileSize > limit {
+			f.logger.Error("Memory limit exceeded during Firestore fetch", "limit_bytes", limit, "current_bytes", currentBytes, "aborted_file", fileData.Path)
+			return nil, fmt.Errorf("%w: > %d bytes", ErrContextTooLarge, limit)
+		}
+
+		currentBytes += fileSize
 		filesMap[fileData.Path] = fileData.Content
 	}
 
-	f.logger.Info("Successfully fetched context files", "cacheID", cacheID.String(), "total_files_loaded", len(filesMap))
+	f.logger.Info("Successfully fetched context files", "cacheID", cacheID.String(), "total_files_loaded", len(filesMap), "total_bytes", currentBytes)
 	return filesMap, nil
 }

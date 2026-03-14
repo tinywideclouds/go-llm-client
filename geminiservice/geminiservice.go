@@ -43,6 +43,8 @@ func NewGeminiService(
 		SessionService: sessionService,
 		LLM:            llmManager,
 		Fetcher:        fetcher,
+		CachePolicy:    api.NewCachePolicy(),
+		Timeouts:       cfg.Timeouts, // FIX: Inject the loaded timeouts here!
 		Logger:         logger,
 	}
 
@@ -61,6 +63,9 @@ func NewGeminiService(
 	// 6. Register API Routes with CORS and Auth
 	buildCacheHandler := http.HandlerFunc(apiHandler.BuildCompiledCacheHandler)
 	mux.Handle("POST /v1/llm/compiled_cache/build", corsMiddleware(authMiddleware(buildCacheHandler)))
+
+	generateHandler := http.HandlerFunc(apiHandler.GenerateHandler)
+	mux.Handle("POST /v1/llm/generate", corsMiddleware(authMiddleware(generateHandler)))
 
 	generateStreamHandler := http.HandlerFunc(apiHandler.GenerateStreamHandler)
 	mux.Handle("POST /v1/llm/generate-stream", corsMiddleware(authMiddleware(generateStreamHandler)))

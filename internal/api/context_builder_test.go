@@ -41,7 +41,7 @@ func TestBuildInlineContext(t *testing.T) {
 	}
 
 	attachments := []builder.Attachment{
-		{CacheID: mustURN("urn:llm:cache:1")},
+		{DataSourceID: mustURN("urn:llm:cache:1")},
 	}
 
 	result := api.BuildInlineContext(context.Background(), fetcher, attachments, logger)

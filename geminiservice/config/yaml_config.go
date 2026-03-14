@@ -2,6 +2,7 @@ package config
 
 import (
 	"log/slog"
+	"time"
 
 	"github.com/tinywideclouds/go-llm-client/internal/store"
 	"github.com/tinywideclouds/go-microservice-base/pkg/middleware"
@@ -18,7 +19,15 @@ type YamlConfig struct {
 		BundleCollection   string `yaml:"bundle_collection"`
 		FilesCollection    string `yaml:"files_collection"`
 		ProfilesCollection string `yaml:"profiles_collection"`
+		MaxFetchMB         int64  `yaml:"max_fetch_mb"`
 	} `yaml:"firestore"`
+
+	Timeouts struct {
+		DatabaseIO  time.Duration `yaml:"database_io"`
+		CacheBuild  time.Duration `yaml:"cache_build"`
+		LLMGenerate time.Duration `yaml:"llm_generate"`
+		LLMStream   time.Duration `yaml:"llm_stream"`
+	} `yaml:"timeouts"`
 
 	Cors struct {
 		AllowedOrigins []string `yaml:"allowed_origins"`
@@ -46,6 +55,32 @@ func NewConfigFromYaml(baseCfg *YamlConfig, logger *slog.Logger) (*Config, error
 		pc = "FilterProfiles"
 	}
 
+	maxFetchBytes := baseCfg.Firestore.MaxFetchMB * 1024 * 1024
+	if maxFetchBytes <= 0 {
+		maxFetchBytes = 100 * 1024 * 1024 // Default to 100MB
+	}
+
+	// Apply sensible defaults if not specified in YAML
+	dbIO := baseCfg.Timeouts.DatabaseIO
+	if dbIO == 0 {
+		dbIO = 10 * time.Second
+	}
+
+	cacheBuild := baseCfg.Timeouts.CacheBuild
+	if cacheBuild == 0 {
+		cacheBuild = 120 * time.Second
+	}
+
+	llmGen := baseCfg.Timeouts.LLMGenerate
+	if llmGen == 0 {
+		llmGen = 60 * time.Second
+	}
+
+	llmStream := baseCfg.Timeouts.LLMStream
+	if llmStream == 0 {
+		llmStream = 5 * time.Minute
+	}
+
 	cfg := &Config{
 		RunMode:            baseCfg.RunMode,
 		HTTPListenAddr:     baseCfg.HTTPListenAddr,
@@ -55,6 +90,13 @@ func NewConfigFromYaml(baseCfg *YamlConfig, logger *slog.Logger) (*Config, error
 			BundleCollection:   bc,
 			FilesCollection:    fc,
 			ProfilesCollection: pc,
+			MaxFetchBytes:      maxFetchBytes,
+		},
+		Timeouts: TimeoutsConfig{
+			DatabaseIO:  dbIO,
+			CacheBuild:  cacheBuild,
+			LLMGenerate: llmGen,
+			LLMStream:   llmStream,
 		},
 		CorsConfig: middleware.CorsConfig{
 			AllowedOrigins: baseCfg.Cors.AllowedOrigins,

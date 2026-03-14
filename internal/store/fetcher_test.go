@@ -25,11 +25,6 @@ func TestFirestoreFetcher_Integration(t *testing.T) {
 	defer client.Close()
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	fetcher := store.NewFirestoreFetcher(client, store.StoreCollections{
-		BundleCollection:   "bundle",
-		FilesCollection:    "files",
-		ProfilesCollection: "profiles",
-	}, logger)
 
 	cacheID := mustURN("urn:llm:cache:test-cache-123")
 
@@ -51,12 +46,33 @@ func TestFirestoreFetcher_Integration(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// 2. Execute the Fetcher (No Profile Filter)
-	files, err := fetcher.FetchCacheFiles(ctx, cacheID, nil)
-	require.NoError(t, err)
+	t.Run("Successfully fetches context within memory limits", func(t *testing.T) {
+		fetcher := store.NewFirestoreFetcher(client, store.StoreCollections{
+			BundleCollection:   "bundle",
+			FilesCollection:    "files",
+			ProfilesCollection: "profiles",
+			MaxFetchBytes:      1024 * 1024, // 1 MB limit (plenty for this test)
+		}, logger)
 
-	// 3. Assertions
-	assert.Len(t, files, 2)
-	assert.Equal(t, "package main", files["main.go"])
-	assert.Equal(t, "# Test Repo", files["README.md"])
+		files, err := fetcher.FetchCacheFiles(ctx, cacheID, nil)
+		require.NoError(t, err)
+
+		assert.Len(t, files, 2)
+		assert.Equal(t, "package main", files["main.go"])
+		assert.Equal(t, "# Test Repo", files["README.md"])
+	})
+
+	t.Run("Fails with ErrContextTooLarge when hitting memory limits", func(t *testing.T) {
+		fetcher := store.NewFirestoreFetcher(client, store.StoreCollections{
+			BundleCollection:   "bundle",
+			FilesCollection:    "files",
+			ProfilesCollection: "profiles",
+			MaxFetchBytes:      10, // Artificially low 10 byte limit
+		}, logger)
+
+		files, err := fetcher.FetchCacheFiles(ctx, cacheID, nil)
+
+		require.ErrorIs(t, err, store.ErrContextTooLarge)
+		require.Nil(t, files)
+	})
 }

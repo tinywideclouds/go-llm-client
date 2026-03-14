@@ -46,8 +46,8 @@ func TestFirestoreSessionStore_Integration(t *testing.T) {
 		cc := &builder.CompiledCache{
 			ID:       mustURN("urn:llm:compiled-cache:cc-999"),
 			Provider: "gemini",
-			AttachmentsUsed: []builder.Attachment{
-				{ID: mustURN("urn:llm:attachment:att-1"), CacheID: baseCacheID},
+			Sources: []builder.Attachment{
+				{ID: mustURN("urn:llm:attachment:att-1"), DataSourceID: baseCacheID},
 			},
 			CreatedAt: time.Now().Truncate(time.Millisecond),
 		}
@@ -61,7 +61,7 @@ func TestFirestoreSessionStore_Integration(t *testing.T) {
 
 		assert.Equal(t, mustURN("urn:llm:compiled-cache:cc-999"), caches[0].ID)
 		assert.Equal(t, builder.CompiledCacheProvider("gemini"), caches[0].Provider)
-		assert.Equal(t, mustURN("urn:llm:attachment:att-1"), caches[0].AttachmentsUsed[0].ID)
+		assert.Equal(t, mustURN("urn:llm:attachment:att-1"), caches[0].Sources[0].ID)
 	})
 
 	t.Run("Sessions GetOrCreate and Persistence", func(t *testing.T) {

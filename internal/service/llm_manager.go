@@ -2,37 +2,26 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"iter"
 	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/tinywideclouds/go-llm-client/internal/store"
+	"github.com/tinywideclouds/go-llm-client/internal/tools"
 	"github.com/tinywideclouds/go-llm/pkg/builder/v1"
 	urn "github.com/tinywideclouds/go-platform/pkg/net/v1"
 
 	"google.golang.org/genai"
 )
 
-// extractGeminiCacheName strips the URN formatting to yield the raw GenAI cache name
-// e.g., "urn:llm:compiled-cache:cachedContents/123" -> "cachedContents/123"
-func extractGeminiCacheName(u *urn.URN) string {
-	if u == nil {
-		return ""
-	}
-	str := u.String()
-	parts := strings.SplitN(str, ":", 4)
-	if len(parts) == 4 {
-		return parts[3]
-	}
-	return str
-}
-
 type LLMManager interface {
 	CreateRepositoryCache(ctx context.Context, model string, files map[string]string, ttl time.Duration, explicitInstructions map[string]string) (urn.URN, error)
-	GenerateResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID *urn.URN, extraHistory []*genai.Content) (*genai.GenerateContentResponse, error)
-	GenerateStreamResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID *urn.URN, extraHistory []*genai.Content) iter.Seq2[*genai.GenerateContentResponse, error]
+
+	GenerateResponse(ctx context.Context, model string, systemPrompt string, prompt string) (*builder.GenerateResponse, error)
+
+	GenerateStreamResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID *urn.URN, extraHistory []*genai.Content, thinkingLevel *builder.ThinkingLevel) iter.Seq2[*genai.GenerateContentResponse, error]
 
 	// Tool Interception - Pure stateless parser
 	InterceptToolCalls(ctx context.Context, chunk *genai.GenerateContentResponse, sessionID urn.URN) ([]*builder.ChangeProposal, error)
@@ -95,8 +84,7 @@ func (m *geminiManager) CreateRepositoryCache(ctx context.Context, model string,
 
 	m.Logger.Info("Gemini Cache created successfully", "cache_name", createdCache.Name)
 
-	cacheURNStr := fmt.Sprintf("urn:llm:compiled-cache:%s", createdCache.Name)
-	cacheURN, err := urn.Parse(cacheURNStr)
+	cacheURN, err := tools.NewCompiledCacheURN(createdCache.Name)
 	if err != nil {
 		return urn.URN{}, fmt.Errorf("failed to parse generated cache name into URN: %w", err)
 	}
@@ -104,28 +92,86 @@ func (m *geminiManager) CreateRepositoryCache(ctx context.Context, model string,
 	return cacheURN, nil
 }
 
+// applyThinkingConfig maps our string to the GenAI SDK ThinkingLevel types
+func applyThinkingConfig(config *genai.GenerateContentConfig, level *builder.ThinkingLevel) {
+	var tl genai.ThinkingLevel = "HIGH"
+
+	if level != nil {
+		switch *level {
+		case "low":
+			tl = "LOW"
+		case "medium":
+			tl = "MEDIUM"
+		case "high":
+			tl = "HIGH"
+		default:
+			tl = "HIGH"
+		}
+	}
+
+	config.ThinkingConfig = &genai.ThinkingConfig{
+		ThinkingLevel: tl,
+	}
+}
+
 // GenerateResponse generates a single blocking response utilizing the cache if provided.
-func (m *geminiManager) GenerateResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID *urn.URN, extraHistory []*genai.Content) (*genai.GenerateContentResponse, error) {
-	contents := BuildHistoryContents(history, overlayPrompt)
-	if len(extraHistory) > 0 {
-		contents = append(contents, extraHistory...)
-	}
-
+func (m *geminiManager) GenerateResponse(ctx context.Context, model string, systemPrompt string, prompt string) (*builder.GenerateResponse, error) {
 	config := &genai.GenerateContentConfig{
-		Tools: GetWorkspaceTools(),
+		Temperature: genai.Ptr(float32(0.2)),
 	}
 
-	if cacheID != nil {
-		geminiName := extractGeminiCacheName(cacheID)
-		config.CachedContent = geminiName
-		m.Logger.Debug("Using Gemini Context Cache for generation", "cache_name", geminiName)
+	// Cleanly attach the system prompt using the SDK's native feature
+	if systemPrompt != "" {
+		config.SystemInstruction = &genai.Content{
+			Parts: []*genai.Part{{Text: systemPrompt}},
+		}
 	}
 
-	return m.client.Models.GenerateContent(ctx, model, contents, config)
+	// Send the payload as a simple, single-turn user prompt
+	history := []*genai.Content{{
+		Role:  "user",
+		Parts: []*genai.Part{{Text: prompt}},
+	}}
+
+	res, err := m.client.Models.GenerateContent(ctx, model, history, config)
+	if err != nil {
+		return nil, fmt.Errorf("GenerateContent failed: %w", err)
+	}
+
+	if len(res.Candidates) == 0 || res.Candidates[0].Content == nil {
+		return nil, errors.New("LLM returned no candidates or empty content")
+	}
+
+	var fullText string
+	for _, part := range res.Candidates[0].Content.Parts {
+		if part.Text != "" {
+			fullText += part.Text
+		}
+	}
+
+	finishReason := ""
+	if string(res.Candidates[0].FinishReason) != "" {
+		finishReason = string(res.Candidates[0].FinishReason)
+	}
+
+	var promptTokens, candidateTokens int32
+	if res.UsageMetadata != nil {
+		promptTokens = res.UsageMetadata.PromptTokenCount
+		candidateTokens = res.UsageMetadata.CandidatesTokenCount
+	}
+
+	m.Logger.Info("returning response", "text", fullText)
+
+	return &builder.GenerateResponse{
+		Content:             fullText,
+		FinishReason:        finishReason,
+		PromptTokenCount:    promptTokens,
+		CandidateTokenCount: candidateTokens,
+	}, nil
 }
 
 // GenerateStreamResponse streams the generation back utilizing the cache if provided.
-func (m *geminiManager) GenerateStreamResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID *urn.URN, extraHistory []*genai.Content) iter.Seq2[*genai.GenerateContentResponse, error] {
+func (m *geminiManager) GenerateStreamResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID *urn.URN, extraHistory []*genai.Content, thinkingLevel *builder.ThinkingLevel) iter.Seq2[*genai.GenerateContentResponse, error] {
 	contents := BuildHistoryContents(history, overlayPrompt)
 	if len(extraHistory) > 0 {
 		contents = append(contents, extraHistory...)
@@ -133,8 +179,10 @@ func (m *geminiManager) GenerateStreamResponse(ctx context.Context, model string
 
 	config := &genai.GenerateContentConfig{}
 
+	applyThinkingConfig(config, thinkingLevel)
+
 	if cacheID != nil {
-		geminiName := extractGeminiCacheName(cacheID)
+		geminiName := cacheID.EntityID()
 		config.CachedContent = geminiName
 		// DO NOT set config.Tools here if cacheID is present to avoid GenAI HTTP 400 errors
 		m.Logger.Debug("Using Gemini Context Cache for stream generation", "cache_name", geminiName)
@@ -142,6 +190,8 @@ func (m *geminiManager) GenerateStreamResponse(ctx context.Context, model string
 		// Only set tools for non-cached "fallback" calls
 		config.Tools = GetWorkspaceTools()
 	}
+
+	m.Logger.Info("actual thinking level", "thinking leve", config.ThinkingConfig)
 
 	return m.client.Models.GenerateContentStream(ctx, model, contents, config)
 }
@@ -157,11 +207,13 @@ func (m *geminiManager) InterceptToolCalls(ctx context.Context, chunk *genai.Gen
 	m.Logger.Debug("InterceptToolCalls inspecting candidate parts", "parts_count", len(parts))
 
 	for i, part := range parts {
+		if part.Thought {
+			m.Logger.Info("Found propose_change tool call in chunk part", "thought?", part.FileData, "part_index", i)
+		}
+
 		if part.FunctionCall == nil || part.FunctionCall.Name != "propose_change" {
 			continue
 		}
-
-		m.Logger.Info("Found propose_change tool call in chunk part", "part_index", i)
 
 		args := part.FunctionCall.Args
 		filePath, _ := args["file_path"].(string)

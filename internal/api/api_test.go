@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tinywideclouds/go-llm-client/geminiservice/config"
 	"github.com/tinywideclouds/go-llm-client/internal/api"
 	"github.com/tinywideclouds/go-llm/pkg/builder/v1"
 	urn "github.com/tinywideclouds/go-platform/pkg/net/v1"
@@ -51,9 +52,10 @@ func (m *mockSessionService) SaveCompiledCache(ctx context.Context, firestoreCac
 
 type mockLLMManager struct {
 	CreateRepositoryCacheFunc  func(ctx context.Context, model string, files map[string]string, ttl time.Duration, explicitInstructions map[string]string) (urn.URN, error)
-	GenerateResponseFunc       func(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID *urn.URN, extraHistory []*genai.Content) (*genai.GenerateContentResponse, error)
-	GenerateStreamResponseFunc func(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID *urn.URN, extraHistory []*genai.Content) iter.Seq2[*genai.GenerateContentResponse, error]
+	GenerateStreamResponseFunc func(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID *urn.URN, extraHistory []*genai.Content, thinkingLevel *builder.ThinkingLevel) iter.Seq2[*genai.GenerateContentResponse, error]
 	InterceptToolCallsFunc     func(ctx context.Context, chunk *genai.GenerateContentResponse, sessionID urn.URN) ([]*builder.ChangeProposal, error)
+	// NEW
+	GenerateResponseFunc func(ctx context.Context, model string, systemPrompt string, prompt string) (*builder.GenerateResponse, error)
 }
 
 func (m *mockLLMManager) CreateRepositoryCache(ctx context.Context, model string, files map[string]string, ttl time.Duration, explicitInstructions map[string]string) (urn.URN, error) {
@@ -63,16 +65,9 @@ func (m *mockLLMManager) CreateRepositoryCache(ctx context.Context, model string
 	return mustURN("urn:llm:compiled-cache:gemini-123"), nil
 }
 
-func (m *mockLLMManager) GenerateResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID *urn.URN, extraHistory []*genai.Content) (*genai.GenerateContentResponse, error) {
-	if m.GenerateResponseFunc != nil {
-		return m.GenerateResponseFunc(ctx, model, overlayPrompt, history, cacheID, extraHistory)
-	}
-	return &genai.GenerateContentResponse{}, nil
-}
-
-func (m *mockLLMManager) GenerateStreamResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID *urn.URN, extraHistory []*genai.Content) iter.Seq2[*genai.GenerateContentResponse, error] {
+func (m *mockLLMManager) GenerateStreamResponse(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID *urn.URN, extraHistory []*genai.Content, thinkingLevel *builder.ThinkingLevel) iter.Seq2[*genai.GenerateContentResponse, error] {
 	if m.GenerateStreamResponseFunc != nil {
-		return m.GenerateStreamResponseFunc(ctx, model, overlayPrompt, history, cacheID, extraHistory)
+		return m.GenerateStreamResponseFunc(ctx, model, overlayPrompt, history, cacheID, extraHistory, thinkingLevel)
 	}
 	return func(yield func(*genai.GenerateContentResponse, error) bool) {}
 }
@@ -82,6 +77,14 @@ func (m *mockLLMManager) InterceptToolCalls(ctx context.Context, chunk *genai.Ge
 		return m.InterceptToolCallsFunc(ctx, chunk, sessionID)
 	}
 	return nil, nil
+}
+
+// NEW
+func (m *mockLLMManager) GenerateResponse(ctx context.Context, model string, systemPrompt string, prompt string) (*builder.GenerateResponse, error) {
+	if m.GenerateResponseFunc != nil {
+		return m.GenerateResponseFunc(ctx, model, systemPrompt, prompt)
+	}
+	return &builder.GenerateResponse{Content: "default response"}, nil
 }
 
 func setupAPI() (*api.API, *mockSessionService, *mockFetcher, *mockLLMManager) {
@@ -95,13 +98,54 @@ func setupAPI() (*api.API, *mockSessionService, *mockFetcher, *mockLLMManager) {
 		LLM:            llmMgr,
 		Fetcher:        fetcher,
 		CachePolicy:    api.NewCachePolicy(),
-		Logger:         logger,
+		Timeouts: config.TimeoutsConfig{
+			DatabaseIO:  10 * time.Second,
+			CacheBuild:  120 * time.Second,
+			LLMGenerate: 60 * time.Second,
+			LLMStream:   5 * time.Minute,
+		},
+		Logger: logger,
 	}
 
 	return apiHandler, sessionSvc, fetcher, llmMgr
 }
 
 // --- Tests ---
+
+func TestGenerateHandler_Success(t *testing.T) {
+	apiHandler, _, _, llmMgr := setupAPI()
+
+	llmMgr.GenerateResponseFunc = func(ctx context.Context, model string, systemPrompt string, prompt string) (*builder.GenerateResponse, error) {
+		return &builder.GenerateResponse{
+			Content:             "Here is the digest.",
+			FinishReason:        "STOP",
+			PromptTokenCount:    100,
+			CandidateTokenCount: 20,
+		}, nil
+	}
+
+	reqBody := `{"model": "gemini-3.1-pro", "systemPrompt": "Summarize.", "prompt": "text to summarize"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/llm/generate", strings.NewReader(reqBody))
+
+	w := httptest.NewRecorder()
+	apiHandler.GenerateHandler(w, req)
+
+	res := w.Result()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("Expected 200 OK, got %d", res.StatusCode)
+	}
+
+	bodyBytes, _ := io.ReadAll(res.Body)
+	bodyStr := string(bodyBytes)
+
+	// Validate protojson camelCase serialization works correctly
+	if !strings.Contains(bodyStr, `"content":"Here is the digest."`) {
+		t.Errorf("Missing content in response: %s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, `"promptTokenCount":100`) {
+		t.Errorf("Missing token metric in response: %s", bodyStr)
+	}
+}
 
 func TestGenerateStreamHandler_ToolInterception(t *testing.T) {
 	apiHandler, _, _, llmMgr := setupAPI()
@@ -116,7 +160,7 @@ func TestGenerateStreamHandler_ToolInterception(t *testing.T) {
 		return []*builder.ChangeProposal{prop}, nil
 	}
 
-	llmMgr.GenerateStreamResponseFunc = func(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID *urn.URN, extraHistory []*genai.Content) iter.Seq2[*genai.GenerateContentResponse, error] {
+	llmMgr.GenerateStreamResponseFunc = func(ctx context.Context, model string, overlayPrompt string, history []builder.Message, cacheID *urn.URN, extraHistory []*genai.Content, thinkingLevel *builder.ThinkingLevel) iter.Seq2[*genai.GenerateContentResponse, error] {
 		return func(yield func(*genai.GenerateContentResponse, error) bool) {
 			dummyChunk := &genai.GenerateContentResponse{}
 			yield(dummyChunk, nil)

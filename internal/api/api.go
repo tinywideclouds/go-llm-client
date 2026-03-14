@@ -1,15 +1,19 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/tinywideclouds/go-llm/pkg/builder/v1"
 	urn "github.com/tinywideclouds/go-platform/pkg/net/v1"
 
+	"github.com/tinywideclouds/go-llm-client/geminiservice/config"
 	"github.com/tinywideclouds/go-llm-client/internal/service"
 	"github.com/tinywideclouds/go-llm-client/internal/session"
 	"github.com/tinywideclouds/go-llm-client/internal/store"
@@ -25,6 +29,7 @@ type API struct {
 	LLM            service.LLMManager
 	Fetcher        store.Fetcher
 	CachePolicy    *CachePolicy
+	Timeouts       config.TimeoutsConfig
 	Logger         *slog.Logger
 }
 
@@ -42,12 +47,25 @@ func (a *API) BuildCompiledCacheHandler(w http.ResponseWriter, r *http.Request) 
 	}
 
 	allFiles := make(map[string]string)
-	for _, att := range req.Sources {
-		// No need to check for empty DataSourceID anymore, JSON unmarshaling guarantees valid URNs
 
-		files, err := a.Fetcher.FetchCacheFiles(r.Context(), att.DataSourceID, att.ProfileID)
+	// DB Phase - strict timeout for fetching from Firestore
+	dbCtx, dbCancel := context.WithTimeout(r.Context(), a.Timeouts.DatabaseIO)
+	defer dbCancel()
+
+	for _, att := range req.Sources {
+		files, err := a.Fetcher.FetchCacheFiles(dbCtx, att.DataSourceID, att.ProfileID)
 		if err != nil {
 			a.Logger.Error("Failed to fetch cache files", "DataSourceID", att.DataSourceID.String(), "error", err)
+
+			if errors.Is(err, store.ErrContextTooLarge) {
+				response.WriteJSONError(w, http.StatusRequestEntityTooLarge, "Context data exceeds the maximum allowed memory limit. Please apply a filter profile (e.g., exclude vendor/ or node_modules/) to reduce the repository size.")
+				return
+			}
+			if errors.Is(dbCtx.Err(), context.DeadlineExceeded) {
+				response.WriteJSONError(w, http.StatusGatewayTimeout, "Database fetch timed out")
+				return
+			}
+
 			response.WriteJSONError(w, http.StatusInternalServerError, "Failed to retrieve context data from database")
 			return
 		}
@@ -69,21 +87,25 @@ func (a *API) BuildCompiledCacheHandler(w http.ResponseWriter, r *http.Request) 
 	}
 
 	a.Logger.Debug("cache", "expires", expires, "reason", reason)
-
 	ttl := expires.Sub(now)
 
-	// Pass the dynamic TTL to your manager, returns strict URN
-	compiledCacheURN, err := a.LLM.CreateRepositoryCache(r.Context(), req.Model, allFiles, ttl, nil)
+	// Build Phase - longer timeout for Google API ingestion
+	buildCtx, buildCancel := context.WithTimeout(r.Context(), a.Timeouts.CacheBuild)
+	defer buildCancel()
 
+	compiledCacheURN, err := a.LLM.CreateRepositoryCache(buildCtx, req.Model, allFiles, ttl, nil)
 	if err != nil {
 		a.Logger.Error("Failed to build Gemini cache", "error", err)
+		if errors.Is(buildCtx.Err(), context.DeadlineExceeded) {
+			response.WriteJSONError(w, http.StatusGatewayTimeout, "Gemini cache creation timed out")
+			return
+		}
 		response.WriteJSONError(w, http.StatusInternalServerError, "Failed to build context cache on Google servers")
 		return
 	}
 
 	baseCacheID := req.Sources[0].DataSourceID
 
-	// ExternalID is gone. We assign the returned cache URN directly to ID.
 	compiledCache := &builder.CompiledCache{
 		ID:        compiledCacheURN,
 		Provider:  "gemini",
@@ -92,7 +114,11 @@ func (a *API) BuildCompiledCacheHandler(w http.ResponseWriter, r *http.Request) 
 		ExpiresAt: expires,
 	}
 
-	if err := a.SessionService.SaveCompiledCache(r.Context(), baseCacheID, compiledCache); err != nil {
+	// Re-use DB context for saving metadata
+	saveCtx, saveCancel := context.WithTimeout(r.Context(), a.Timeouts.DatabaseIO)
+	defer saveCancel()
+
+	if err := a.SessionService.SaveCompiledCache(saveCtx, baseCacheID, compiledCache); err != nil {
 		a.Logger.Error("Failed to save compiled cache metadata", "error", err)
 	}
 
@@ -106,7 +132,37 @@ func (a *API) BuildCompiledCacheHandler(w http.ResponseWriter, r *http.Request) 
 
 // GenerateHandler handles POST /v1/llm/generate
 func (a *API) GenerateHandler(w http.ResponseWriter, r *http.Request) {
-	response.WriteJSONError(w, http.StatusNotImplemented, "Generate not implemented, please use GenerateStream")
+	var req builder.GenerateRequest // Uses the new, dedicated type
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.WriteJSONError(w, http.StatusBadRequest, "Invalid JSON body")
+		return
+	}
+
+	if req.Prompt == "" {
+		response.WriteJSONError(w, http.StatusBadRequest, "Prompt cannot be empty")
+		return
+	}
+
+	model := req.Model
+	if model == "" {
+		model = "gemini-3.1-flash" // or default
+	}
+
+	genCtx, cancel := context.WithTimeout(r.Context(), a.Timeouts.LLMStream)
+	defer cancel()
+
+	genResponse, err := a.LLM.GenerateResponse(genCtx, model, req.SystemPrompt, req.Prompt)
+	if err != nil {
+		a.Logger.Error("Non-streaming generation failed", "error", err)
+		if errors.Is(genCtx.Err(), context.DeadlineExceeded) {
+			response.WriteJSONError(w, http.StatusGatewayTimeout, "LLM generation timed out")
+			return
+		}
+		response.WriteJSONError(w, http.StatusInternalServerError, "Failed to generate response")
+		return
+	}
+
+	response.WriteJSON(w, http.StatusOK, genResponse)
 }
 
 // GenerateStreamHandler handles POST /v1/llm/generate-stream
@@ -139,10 +195,14 @@ func (a *API) GenerateStreamHandler(w http.ResponseWriter, r *http.Request) {
 		model = "gemini-3-flash-preview"
 	}
 
-	inlineContext := BuildInlineContext(r.Context(), a.Fetcher, req.InlineAttachments, a.Logger)
+	// DB Phase - fetch context and proposals quickly
+	dbCtx, dbCancel := context.WithTimeout(r.Context(), a.Timeouts.DatabaseIO)
+	defer dbCancel()
+
+	inlineContext := BuildInlineContext(dbCtx, a.Fetcher, req.InlineAttachments, a.Logger)
 	req.History = InjectInlineContext(req.History, inlineContext)
 
-	pendingProposals, err := a.SessionService.ListProposalsBySession(r.Context(), req.SessionID)
+	pendingProposals, err := a.SessionService.ListProposalsBySession(dbCtx, req.SessionID)
 	if err != nil {
 		a.Logger.Warn("Failed to retrieve pending proposals for context", "error", err)
 	}
@@ -151,37 +211,57 @@ func (a *API) GenerateStreamHandler(w http.ResponseWriter, r *http.Request) {
 
 	a.Logger.Info("Starting to process LLM stream", "session_id", req.SessionID.String())
 
+	// Stream Phase - explicit overarching stream timeout
+	streamCtx, streamCancel := context.WithTimeout(r.Context(), a.Timeouts.LLMStream)
+	defer streamCancel()
+
 	for turn := 0; turn < maxTurns; turn++ {
 		a.Logger.Debug("Starting generation loop turn", "turn", turn)
 
-		// Use CompiledCacheID from the request struct
-		stream := a.LLM.GenerateStreamResponse(r.Context(), model, BuildOverlayPrompt(pendingProposals), req.History, req.CompiledCacheID, extraHistory)
+		stream := a.LLM.GenerateStreamResponse(streamCtx, model, BuildOverlayPrompt(pendingProposals), req.History, req.CompiledCacheID, extraHistory, req.ThinkingLevel)
 
-		var turnModelParts []*genai.Part
+		// FIX: Use a string builder to consolidate fragmented stream text
+		var turnTextBuilder strings.Builder
+		var turnFunctionCalls []*genai.Part
 		var turnToolResponses []*genai.Part
 		madeToolCall := false
 
 		for chunk, err := range stream {
 			if err != nil {
 				a.Logger.Error("Stream error", "error", err)
-				fmt.Fprintf(w, "event: error\ndata: %s\n\n", "Stream interrupted")
+
+				errMsg := "Stream interrupted"
+				if errors.Is(streamCtx.Err(), context.DeadlineExceeded) {
+					errMsg = "LLM generation timed out"
+				}
+
+				fmt.Fprintf(w, "event: error\ndata: %s\n\n", errMsg)
 				flusher.Flush()
 				return
 			}
 
+			// FIX: Only keep explicitly valid data to prevent sending empty parts back to the API
 			if len(chunk.Candidates) > 0 && chunk.Candidates[0].Content != nil {
-				turnModelParts = append(turnModelParts, chunk.Candidates[0].Content.Parts...)
+				for _, part := range chunk.Candidates[0].Content.Parts {
+					if part.FunctionCall != nil {
+						turnFunctionCalls = append(turnFunctionCalls, part)
+					} else if part.Text != "" {
+						turnTextBuilder.WriteString(part.Text)
+					}
+				}
 			}
 
-			props, toolErr := a.LLM.InterceptToolCalls(r.Context(), chunk, req.SessionID)
+			props, toolErr := a.LLM.InterceptToolCalls(streamCtx, chunk, req.SessionID)
 			if toolErr != nil {
 				a.Logger.Error("Tool processing failed", "error", toolErr)
 			}
 
 			if len(props) > 0 {
 				madeToolCall = true
+
+				saveCtx, saveCancel := context.WithTimeout(r.Context(), a.Timeouts.DatabaseIO)
 				for _, prop := range props {
-					if err := a.SessionService.CreateProposal(r.Context(), prop); err != nil {
+					if err := a.SessionService.CreateProposal(saveCtx, prop); err != nil {
 						a.Logger.Error("Failed to save pending proposal", "error", err)
 					}
 
@@ -198,6 +278,7 @@ func (a *API) GenerateStreamHandler(w http.ResponseWriter, r *http.Request) {
 						},
 					})
 				}
+				saveCancel()
 			}
 
 			hasText := false
@@ -228,9 +309,17 @@ func (a *API) GenerateStreamHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		a.Logger.Info("Tool calls detected, looping to satisfy sequential generation dependencies")
+
+		// FIX: Reconstruct a clean, valid `Content` payload for the next loop
+		var finalTurnParts []*genai.Part
+		if turnTextBuilder.Len() > 0 {
+			finalTurnParts = append(finalTurnParts, &genai.Part{Text: turnTextBuilder.String()})
+		}
+		finalTurnParts = append(finalTurnParts, turnFunctionCalls...)
+
 		extraHistory = append(extraHistory, &genai.Content{
 			Role:  "model",
-			Parts: turnModelParts,
+			Parts: finalTurnParts,
 		})
 		extraHistory = append(extraHistory, &genai.Content{
 			Role:  "user",
@@ -251,8 +340,15 @@ func (a *API) ListProposalsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	proposals, err := a.SessionService.ListProposalsBySession(r.Context(), sessionID)
+	dbCtx, dbCancel := context.WithTimeout(r.Context(), a.Timeouts.DatabaseIO)
+	defer dbCancel()
+
+	proposals, err := a.SessionService.ListProposalsBySession(dbCtx, sessionID)
 	if err != nil {
+		if errors.Is(dbCtx.Err(), context.DeadlineExceeded) {
+			response.WriteJSONError(w, http.StatusGatewayTimeout, "Database fetch timed out")
+			return
+		}
 		response.WriteJSONError(w, http.StatusInternalServerError, "Failed to retrieve proposals")
 		return
 	}
@@ -268,8 +364,15 @@ func (a *API) RemoveProposalHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = a.SessionService.RemoveProposal(r.Context(), sessionID, r.PathValue("propId"))
+	dbCtx, dbCancel := context.WithTimeout(r.Context(), a.Timeouts.DatabaseIO)
+	defer dbCancel()
+
+	err = a.SessionService.RemoveProposal(dbCtx, sessionID, r.PathValue("propId"))
 	if err != nil {
+		if errors.Is(dbCtx.Err(), context.DeadlineExceeded) {
+			response.WriteJSONError(w, http.StatusGatewayTimeout, "Database operation timed out")
+			return
+		}
 		response.WriteJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
